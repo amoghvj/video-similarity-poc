@@ -1,12 +1,11 @@
 """
 Analyzer Module
 - Orchestrates the full video similarity detection pipeline
-- Coordinates all modules: VideoProcessor, SearchService, EmbeddingService, SimilarityService
+- Uses the vectorise abstraction for clean video → embedding conversion
 """
 
-from .video_processor import VideoProcessor
+from .vectorise import vectorise, VideoFrameIterator, VectorEmbedding
 from .search_service import SearchService
-from .embedding_service import EmbeddingService
 from .similarity_service import SimilarityService
 
 
@@ -26,15 +25,8 @@ class Analyzer:
         self.threshold = threshold
         self.max_candidates = max_candidates
 
-        self.video_processor = VideoProcessor()
         self.search_service = SearchService(max_results=max_candidates)
-        self.embedding_service = None  # Lazy-loaded
         self.similarity_service = SimilarityService()
-
-    def _ensure_embedding_service(self):
-        """Lazy-load the embedding service (CLIP model) only when needed."""
-        if self.embedding_service is None:
-            self.embedding_service = EmbeddingService()
 
     def run(self, youtube_url: str) -> dict:
         """
@@ -59,52 +51,45 @@ class Analyzer:
             "n_frames": self.n_frames,
         }
 
-        # === Step 1: Download Video ===
-        print("\n[1/6] 📥 Downloading video...")
+        # === Step 1: Vectorise the input video (Async) ===
+        print(f"\n[1/4] 🧠 Vectorising input video ({self.n_frames} frames)...")
         try:
-            video_info = self.video_processor.download_video(youtube_url)
+            # This returns IMMEDIATELY after submitting frames to background
+            input_vector = vectorise(youtube_url, n_frames=self.n_frames)
             results["input_video"] = {
-                "title": video_info["title"],
-                "id": video_info["id"],
+                "title": input_vector.title,
+                "id": input_vector.video_id,
                 "url": youtube_url,
             }
-            print(f"  ✓ Downloaded: {video_info['title']}")
         except RuntimeError as e:
             print(f"  ✗ {e}")
             return results
 
-        # === Step 2: Extract Frames ===
-        print(f"\n[2/6] 🎞️  Extracting {self.n_frames} frames...")
-        try:
-            frames = self.video_processor.extract_frames(
-                video_info["filepath"], n_frames=self.n_frames
-            )
-        except RuntimeError as e:
-            print(f"  ✗ {e}")
-            return results
-
-        # === Step 3: Search YouTube ===
-        print(f"\n[3/6] 🔍 Searching YouTube for similar videos...")
-        candidates = self.search_service.search_videos(video_info["title"])
+        # === Step 2: Search YouTube for candidates ===
+        # Note: This runs while the background threads are still embedding!
+        print(f"\n[2/4] 🔍 Searching YouTube for similar videos...")
+        candidates = self.search_service.search_videos(input_vector.title)
         if not candidates:
             print("  ✗ No candidates found.")
             return results
 
         # Filter out the input video itself
-        candidates = [c for c in candidates if c["id"] != video_info["id"]]
+        candidates = [c for c in candidates if c["id"] != input_vector.video_id]
         print(f"  ✓ {len(candidates)} candidates after filtering self")
 
-        # === Step 4: Generate Frame Embeddings ===
-        print(f"\n[4/6] 🧠 Generating embeddings for {len(frames)} frames...")
-        self._ensure_embedding_service()
-        frame_embeddings = self.embedding_service.get_batch_embeddings(frames)
-        print(f"  ✓ Generated {len(frame_embeddings)} frame embeddings")
+        # === Step 3: Compare with candidates ===
+        print(f"\n[3/4] 📊 Comparing with {len(candidates)} candidates...")
+        
+        # This will BLOCK if any background embeddings are still pending
+        frame_embeddings = input_vector.get_vectors()
 
-        # === Step 5: Compare with Candidates ===
-        print(f"\n[5/6] 📊 Comparing with {len(candidates)} candidates...")
         for i, candidate in enumerate(candidates):
             try:
-                thumb_embedding = self.embedding_service.get_embedding_from_url(
+                # Use the internal service to embed the thumbnail
+                VectorEmbedding._ensure_embedding_service()
+                emb_service = VectorEmbedding._embedding_service
+                
+                thumb_embedding = emb_service.get_embedding_from_url(
                     candidate["thumbnail_url"]
                 )
                 max_sim = self.similarity_service.compute_max_similarity(
@@ -135,8 +120,8 @@ class Analyzer:
                 print(f"  [{i+1}/{len(candidates)}] ⚠️  Skipped (thumbnail error): {candidate['title'][:40]}")
                 continue
 
-        # === Step 6: Sort & Summarize ===
-        print(f"\n[6/6] 📋 Finalizing results...")
+        # === Step 4: Sort & Summarize ===
+        print(f"\n[4/4] 📋 Finalizing results...")
         results["candidates"].sort(key=lambda x: x["max_similarity"], reverse=True)
         results["matches"].sort(key=lambda x: x["max_similarity"], reverse=True)
 

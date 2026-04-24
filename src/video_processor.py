@@ -1,118 +1,247 @@
 """
 Video Processing Module
-- Downloads YouTube videos using yt-dlp
-- Extracts N frames at evenly spaced intervals using OpenCV
+- Fetches video metadata (duration, title, stream URL) via yt-dlp WITHOUT downloading
+- Extracts N frames by seeking directly to calculated timestamps using FFmpeg
+- No full video download required — grabs only the bytes needed for each frame
 """
 
+import io
 import os
+import subprocess
 import tempfile
-import cv2
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
 import yt_dlp
 from PIL import Image
 
 
+def _get_ffmpeg_path() -> str:
+    """
+    Locate a usable ffmpeg binary.
+    Tries system PATH first, then falls back to imageio-ffmpeg's bundled binary.
+    """
+    # 1. Try system ffmpeg
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return "ffmpeg"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 2. Try imageio-ffmpeg bundled binary
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "FFmpeg not found. Install it system-wide or run: pip install imageio-ffmpeg"
+    )
+
+
 class VideoProcessor:
-    """Handles video downloading and frame extraction."""
+    """
+    Handles video metadata retrieval and frame extraction.
 
-    def __init__(self, output_dir: str = None):
-        """
-        Initialize VideoProcessor.
+    Architecture:
+        1. get_video_info()  — Fetches metadata + stream URL (no download)
+        2. extract_frames()  — Uses FFmpeg to seek to specific timestamps
+                               and grab individual frames from the stream
+    """
 
-        Args:
-            output_dir: Directory to store downloaded videos and frames.
-                        If None, uses a temporary directory.
-        """
-        if output_dir is None:
-            output_dir = os.path.join(tempfile.gettempdir(), "video_similarity_poc")
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+    def __init__(self):
+        self.ffmpeg_path = _get_ffmpeg_path()
 
-    def download_video(self, url: str) -> dict:
+    @staticmethod
+    def _clean_youtube_url(url: str) -> str:
         """
-        Download a YouTube video and return metadata + file path.
+        Strip non-essential query parameters from a YouTube URL.
+        Keeps only 'v' (video ID) and 't' (timestamp). Removes comment
+        links (&lc=), playlist params (&list=, &index=), tracking (&si=), etc.
+        """
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+
+        clean_params = {}
+        for key in ("v", "t"):
+            if key in params:
+                clean_params[key] = params[key][0]
+
+        clean_query = urlencode(clean_params)
+        return urlunparse(parsed._replace(query=clean_query))
+
+    def get_video_info(self, url: str) -> dict:
+        """
+        Fetch video metadata and a direct stream URL WITHOUT downloading.
 
         Args:
             url: YouTube video URL.
 
         Returns:
-            dict with keys: 'filepath', 'title', 'id', 'duration'
+            dict with keys:
+                'title', 'id', 'duration' (seconds), 'stream_url', 'url'
 
         Raises:
-            RuntimeError: If the download fails.
+            RuntimeError: If metadata extraction fails.
         """
-        video_path = os.path.join(self.output_dir, "input_video.mp4")
+        url = self._clean_youtube_url(url)
 
         ydl_opts = {
-            "format": "worst[ext=mp4]",  # Smallest MP4 for speed
-            "outtmpl": video_path,
+            "format": "worst[ext=mp4]",
             "quiet": True,
             "no_warnings": True,
-            "overwrites": True,
+            "skip_download": True,
         }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=False)
+
+                # Get the direct stream URL for the selected format
+                stream_url = info.get("url", "")
+                if not stream_url:
+                    # Some formats store it in 'requested_formats'
+                    formats = info.get("requested_formats", [])
+                    if formats:
+                        stream_url = formats[0].get("url", "")
+
+                if not stream_url:
+                    raise RuntimeError("Could not obtain a direct stream URL.")
+
                 return {
-                    "filepath": video_path,
                     "title": info.get("title", "Unknown"),
                     "id": info.get("id", ""),
                     "duration": info.get("duration", 0),
+                    "stream_url": stream_url,
+                    "url": url,
                 }
         except Exception as e:
-            raise RuntimeError(f"Failed to download video: {e}")
+            raise RuntimeError(f"Failed to get video info: {e}")
 
-    def extract_frames(self, video_path: str, n_frames: int = 3) -> list:
+    def calculate_frame_timestamps(self, duration: float, n_frames: int) -> list:
         """
-        Extract N evenly spaced frames from a video file using OpenCV.
+        Calculate evenly spaced timestamps for frame extraction.
+
+        Skips the first and last 5% of the video to avoid intros/outros.
+        Divides the effective length by (n_frames + 1) so frames are
+        evenly distributed with equal gaps at both ends.
 
         Args:
-            video_path: Path to the video file.
+            duration: Total video duration in seconds.
+            n_frames: Number of frames to extract.
+
+        Returns:
+            List of timestamps (in seconds) to extract frames at.
+        """
+        # Define effective region (skip 5% at start and end)
+        effective_start = duration * 0.05
+        effective_end = duration * 0.95
+
+        # For very short videos, use the full duration
+        if effective_end <= effective_start:
+            effective_start = 0
+            effective_end = duration
+
+        effective_length = effective_end - effective_start
+
+        # Divide by (n + 1) so frames are evenly spaced with equal
+        # gaps before the first and after the last frame
+        offset = effective_length / (n_frames + 1)
+
+        timestamps = [
+            round(effective_start + offset * (i + 1), 2)
+            for i in range(n_frames)
+        ]
+
+        return timestamps
+
+    def _grab_frame_at_timestamp(self, stream_url: str, timestamp: float) -> Image.Image:
+        """
+        Use FFmpeg to seek to a specific timestamp in the stream and grab one frame.
+
+        The -ss flag BEFORE -i makes FFmpeg seek using byte-range requests
+        (input seeking), which is extremely fast because it jumps directly
+        to the nearest keyframe without downloading everything before it.
+
+        Args:
+            stream_url: Direct video stream URL.
+            timestamp: Time in seconds to grab the frame at.
+
+        Returns:
+            PIL Image of the grabbed frame.
+
+        Raises:
+            RuntimeError: If FFmpeg fails to grab the frame.
+        """
+        cmd = [
+            self.ffmpeg_path,
+            "-ss", str(timestamp),       # Seek BEFORE input (fast input seeking)
+            "-i", stream_url,            # Stream URL
+            "-frames:v", "1",            # Grab exactly 1 frame
+            "-f", "image2pipe",          # Pipe output as image
+            "-vcodec", "png",            # Output as PNG
+            "-loglevel", "error",        # Only show errors
+            "pipe:1",                    # Write to stdout
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"FFmpeg error at {timestamp}s: {error_msg}")
+
+            if not result.stdout:
+                raise RuntimeError(f"FFmpeg returned no data at {timestamp}s")
+
+            image = Image.open(io.BytesIO(result.stdout)).convert("RGB")
+            return image
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"FFmpeg timed out seeking to {timestamp}s")
+
+    def extract_frames(self, stream_url: str, duration: float, n_frames: int = 3) -> list:
+        """
+        Extract N frames from a video stream by seeking to calculated timestamps.
+
+        No full download is performed — each frame is grabbed individually
+        by seeking directly to the target timestamp in the remote stream.
+
+        Args:
+            stream_url: Direct video stream URL (from get_video_info).
+            duration: Video duration in seconds (from get_video_info).
             n_frames: Number of frames to extract (default 3).
 
         Returns:
             List of PIL Image objects.
 
         Raises:
-            RuntimeError: If the video cannot be opened or frames cannot be extracted.
+            RuntimeError: If no frames could be extracted.
         """
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video file: {video_path}")
+        timestamps = self.calculate_frame_timestamps(duration, n_frames)
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            cap.release()
-            raise RuntimeError("Video has no frames.")
-
-        # Calculate evenly spaced frame indices
-        # Avoid first and last 5% to skip intros/outros
-        start_frame = int(total_frames * 0.05)
-        end_frame = int(total_frames * 0.95)
-        if end_frame <= start_frame:
-            start_frame = 0
-            end_frame = total_frames - 1
-
-        if n_frames == 1:
-            indices = [total_frames // 2]
-        else:
-            step = (end_frame - start_frame) / (n_frames - 1)
-            indices = [int(start_frame + i * step) for i in range(n_frames)]
+        print(f"  Timestamps to extract: {timestamps}")
 
         frames = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if ret:
-                # Convert BGR (OpenCV) to RGB (PIL)
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(frame_rgb)
-                frames.append(pil_image)
-
-        cap.release()
+        for i, ts in enumerate(timestamps):
+            try:
+                frame = self._grab_frame_at_timestamp(stream_url, ts)
+                frames.append(frame)
+                print(f"  ✓ Frame {i+1}/{n_frames} grabbed at {ts:.1f}s")
+            except RuntimeError as e:
+                print(f"  ✗ Frame {i+1}/{n_frames} failed at {ts:.1f}s: {e}")
+                continue
 
         if not frames:
             raise RuntimeError("Failed to extract any frames from the video.")
 
-        print(f"  ✓ Extracted {len(frames)} frames from video")
+        print(f"  ✓ Extracted {len(frames)}/{n_frames} frames total")
         return frames

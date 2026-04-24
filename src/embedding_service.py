@@ -27,7 +27,7 @@ class EmbeddingService:
         self.model = CLIPModel.from_pretrained(model_name).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(model_name)
         self.model.eval()
-        print(f"  ✓ CLIP model loaded on {self.device}")
+        print(f"  [OK] CLIP model loaded on {self.device}")
 
     def get_image_embedding(self, image: Image.Image) -> np.ndarray:
         """
@@ -41,7 +41,18 @@ class EmbeddingService:
         """
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            embedding = self.model.get_image_features(**inputs)
+            output = self.model.get_image_features(**inputs)
+
+        # Handle both old (raw tensor) and new (object) return types
+        if hasattr(output, "image_embeds"):
+            embedding = output.image_embeds
+        elif hasattr(output, "pooler_output"):
+            embedding = output.pooler_output
+        elif isinstance(output, torch.Tensor):
+            embedding = output
+        else:
+            # Last resort: try indexing like a tensor
+            embedding = output[0] if hasattr(output, "__getitem__") else output
 
         # Normalize the embedding
         embedding = embedding / embedding.norm(dim=-1, keepdim=True)
