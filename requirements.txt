@@ -1,0 +1,7 @@
+yt-dlp
+opencv-python
+Pillow
+requests
+numpy
+torch
+transformers
