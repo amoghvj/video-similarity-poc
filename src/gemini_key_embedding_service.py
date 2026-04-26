@@ -21,7 +21,7 @@ class GeminiKeyEmbeddingService:
     and sleeping exactly that long before retrying (up to 3 attempts).
     """
 
-    EMBEDDING_DIM = 768  # text-embedding-004 output dimension
+    EMBEDDING_DIM = 3072  # gemini-embedding-001 output dimension
 
     _DESCRIBE_PROMPT = (
         "Describe this video frame in detail for copyright detection: "
@@ -68,7 +68,7 @@ class GeminiKeyEmbeddingService:
 
         response = self._call_with_retry(
             self._client.models.generate_content,
-            model="gemini-2.0-flash-lite",
+            model="gemini-2.5-flash",
             contents=[
                 types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
                 self._DESCRIBE_PROMPT,
@@ -80,7 +80,7 @@ class GeminiKeyEmbeddingService:
         description = self._describe_image(image)
         result = self._call_with_retry(
             self._client.models.embed_content,
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             contents=description,
             config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
         )
