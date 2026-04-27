@@ -11,12 +11,17 @@ import { PreUploadSection } from './sections/PreUploadSection'
 import { NewScanSection } from './sections/NewScanSection'
 import { useJobStatus, useJobResults } from './hooks/useApi'
 import type { Detection } from './types'
+import { LoadingScreen } from './components/LoadingScreen'
+import { InsightModal } from './components/InsightModal'
+import type { RadarNodeType } from './components/IntelligenceRadar'
 
 export default function App() {
   const [activePage, setActivePage] = useState('dashboard')
   const [selectedDetection, setSelectedDetection] = useState<Detection | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [jobId, setJobId] = useState<string | null>(null)
+  const [showLoading, setShowLoading] = useState(true)
+  const [radarModalType, setRadarModalType] = useState<RadarNodeType | null>(null)
 
   const { status, progress } = useJobStatus(jobId)
   const { results } = useJobResults(jobId, status)
@@ -82,6 +87,7 @@ export default function App() {
               riskSummary={results.risk_summary}
               selectedDetection={selectedDetection}
               onSelectDetection={handleSelectDetection}
+              onRadarNodeClick={setRadarModalType}
             />
           </div>
         )}
@@ -100,6 +106,7 @@ export default function App() {
             detections={results.detections}
             selectedNodeId={selectedNodeId}
             onSelectNode={(id) => setSelectedNodeId(prev => prev === id ? null : id)}
+            onRadarNodeClick={setRadarModalType}
           />
         )}
 
@@ -117,11 +124,20 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex" style={{ backgroundColor: '#09090B' }}>
+      {showLoading && <LoadingScreen onComplete={() => setShowLoading(false)} />}
       <Sidebar activePage={activePage} onNavigate={setActivePage} />
       <div className="flex-1 flex flex-col min-h-screen min-w-0" style={{ marginLeft: 240 }}>
         <TopNav title={getPageTitle()} />
         {renderContent()}
       </div>
+      <InsightModal
+        isOpen={!!radarModalType}
+        type={radarModalType}
+        onClose={() => setRadarModalType(null)}
+        detections={results?.detections}
+        propagationNodes={results?.propagation_nodes}
+        riskSummary={results?.risk_summary}
+      />
     </div>
   )
 }
