@@ -25,6 +25,7 @@ export default function App() {
   const [showLoading, setShowLoading] = useState(true)
   const [radarModalType, setRadarModalType] = useState<RadarNodeType | null>(null)
   const [assets, setAssets] = useState<Asset[]>([])
+  const [reportIds, setReportIds] = useState<Set<string>>(new Set())
 
   const { status, progress } = useJobStatus(jobId)
   const { results } = useJobResults(jobId, status)
@@ -114,6 +115,10 @@ export default function App() {
             detections={results.detections}
             selectedDetection={selectedDetection}
             onSelectDetection={handleSelectDetection}
+            onNavigateToReports={(ids) => {
+              setReportIds(ids)
+              setActivePage('reports')
+            }}
           />
         )}
 
@@ -130,7 +135,7 @@ export default function App() {
         {activePage === 'reports' && (
           <ReportsSection
             jobId={jobId!}
-            detections={results.detections}
+            detections={reportIds.size > 0 ? results.detections.filter(d => reportIds.has(d.id)) : results.detections}
             metrics={results.metrics}
             riskSummary={results.risk_summary}
           />

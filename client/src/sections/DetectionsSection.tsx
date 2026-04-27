@@ -9,6 +9,7 @@ interface DetectionsSectionProps {
   detections: Detection[]
   selectedDetection: Detection | null
   onSelectDetection: (d: Detection) => void
+  onNavigateToReports?: (reportIds: Set<string>) => void
 }
 
 function SimilarityMeter({ value }: { value: number }) {
@@ -119,7 +120,7 @@ function DetectionCard({
   )
 }
 
-export function DetectionsSection({ detections, selectedDetection, onSelectDetection }: DetectionsSectionProps) {
+export function DetectionsSection({ detections, selectedDetection, onSelectDetection, onNavigateToReports }: DetectionsSectionProps) {
   const [filterRisk, setFilterRisk] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [reviewedIds, setReviewedIds] = useState<Set<string>>(new Set())
@@ -146,17 +147,19 @@ export function DetectionsSection({ detections, selectedDetection, onSelectDetec
   const handleFlagForTakedown = () => {
     if (!selectedDetection) return
     const newFlagged = new Set(flaggedIds)
-    if (newFlagged.has(selectedDetection.id)) {
-      newFlagged.delete(selectedDetection.id)
-    } else {
+    const isAdding = !newFlagged.has(selectedDetection.id)
+    
+    if (isAdding) {
       newFlagged.add(selectedDetection.id)
+    } else {
+      newFlagged.delete(selectedDetection.id)
     }
     setFlaggedIds(newFlagged)
     setShowNotification({
-      type: 'warning',
-      message: newFlagged.has(selectedDetection.id) ? 'Flagged for takedown' : 'Removed from flagged',
+      type: isAdding ? 'success' : 'warning',
+      message: isAdding ? '✓ The video is successfully reported on YouTube' : 'Removed from flagged',
     })
-    setTimeout(() => setShowNotification(null), 2000)
+    setTimeout(() => setShowNotification(null), 3000)
   }
 
   const handleAddToReport = () => {
@@ -447,11 +450,11 @@ export function DetectionsSection({ detections, selectedDetection, onSelectDetec
                     whileHover={{ scale: 1.02 }}
                     whileTap={{ scale: 0.98 }}
                     onClick={handleAddToReport}
-                    className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl font-semibold text-sm transition-colors"
+                    className="flex-1 flex items-center justify-center gap-2 py-3 px-4 rounded-xl font-semibold text-sm transition-colors"
                     style={{
                       backgroundColor: reportIds.has(selectedDetection.id) ? 'rgba(99,102,241,0.3)' : 'rgba(99,102,241,0.15)',
                       border: `1px solid rgba(99,102,241,${reportIds.has(selectedDetection.id) ? 0.5 : 0.3})`,
-                      color: '#818CF8',
+                      color: '#6366F1',
                     }}
                   >
                     <Pin className="w-4 h-4" />

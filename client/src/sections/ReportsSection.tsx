@@ -160,15 +160,25 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
     }
 
     // Create blob and download
-    const blob = new Blob([fullContent], { type: 'text/csv;charset=utf-8;' })
-    const link = document.createElement('a')
-    const url = URL.createObjectURL(blob)
-    link.setAttribute('href', url)
-    link.setAttribute('download', `visionguard-report-${jobId.slice(0, 8)}-${new Date().toISOString().split('T')[0]}.csv`)
-    link.style.visibility = 'hidden'
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
+    try {
+      const blob = new Blob([fullContent], { type: 'text/csv;charset=utf-8;' })
+      const link = document.createElement('a')
+      const url = URL.createObjectURL(blob)
+      link.href = url
+      link.download = `visionguard-report-${jobId.slice(0, 8)}-${new Date().toISOString().split('T')[0]}.csv`
+      link.style.visibility = 'hidden'
+      document.body.appendChild(link)
+      link.click()
+      
+      // Cleanup after a small delay to ensure download starts
+      setTimeout(() => {
+        document.body.removeChild(link)
+        URL.revokeObjectURL(url)
+      }, 100)
+    } catch (err) {
+      console.error('Export failed:', err)
+      alert('Failed to export report. Please try again.')
+    }
   }
 
   return (
