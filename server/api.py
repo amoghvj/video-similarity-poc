@@ -35,9 +35,12 @@ from src.vectorise import vectorise, VectorEmbedding
 
 app = FastAPI()
 
+
+# Read allowed CORS origin from environment variable
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
