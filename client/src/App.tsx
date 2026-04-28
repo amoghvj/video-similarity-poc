@@ -9,6 +9,8 @@ import { PropagationSection } from './sections/PropagationSection'
 import { ReportsSection } from './sections/ReportsSection'
 import { PreUploadSection } from './sections/PreUploadSection'
 import { NewScanSection } from './sections/NewScanSection'
+import { AssetsSection } from './sections/AssetsSection'
+import type { Asset } from './sections/AssetsSection'
 import { useJobStatus, useJobResults } from './hooks/useApi'
 import type { Detection } from './types'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -22,6 +24,8 @@ export default function App() {
   const [jobId, setJobId] = useState<string | null>(null)
   const [showLoading, setShowLoading] = useState(true)
   const [radarModalType, setRadarModalType] = useState<RadarNodeType | null>(null)
+  const [assets, setAssets] = useState<Asset[]>([])
+  const [reportIds, setReportIds] = useState<Set<string>>(new Set())
 
   const { status, progress } = useJobStatus(jobId)
   const { results } = useJobResults(jobId, status)
@@ -38,11 +42,25 @@ export default function App() {
       case 'detections': return 'Detections'
       case 'propagation': return 'Propagation Graph'
       case 'reports': return 'Intelligence Reports'
+      case 'assets': return 'Monitored Assets'
       default: return 'VisionGuard'
     }
   }
 
   const renderContent = () => {
+    if (activePage === 'assets') {
+      return (
+        <main className="flex-1 px-8 pb-12 animate-fade-in" style={{ paddingTop: 88, height: '100vh' }}>
+          <AssetsSection 
+            assets={assets}
+            onAddAsset={(asset) => setAssets([...assets, asset])}
+            onRemoveAsset={(id) => setAssets(assets.filter(a => a.id !== id))}
+            onUpdateAsset={(updatedAsset) => setAssets(assets.map(a => a.id === updatedAsset.id ? updatedAsset : a))}
+          />
+        </main>
+      )
+    }
+
     if (activePage === 'precheck') {
       return (
         <main className="flex-1 px-8 pb-12 animate-fade-in" style={{ paddingTop: 88, height: '100vh' }}>
@@ -97,6 +115,10 @@ export default function App() {
             detections={results.detections}
             selectedDetection={selectedDetection}
             onSelectDetection={handleSelectDetection}
+            onNavigateToReports={(ids) => {
+              setReportIds(ids)
+              setActivePage('reports')
+            }}
           />
         )}
 
@@ -113,7 +135,7 @@ export default function App() {
         {activePage === 'reports' && (
           <ReportsSection
             jobId={jobId!}
-            detections={results.detections}
+            detections={reportIds.size > 0 ? results.detections.filter(d => reportIds.has(d.id)) : results.detections}
             metrics={results.metrics}
             riskSummary={results.risk_summary}
           />
