@@ -3,6 +3,7 @@ import os
 import datetime
 import time
 import uuid
+import json
 from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +15,10 @@ from typing import Dict, Any, List, Optional
 
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from src.analyzer import Analyzer
 from src.video_processor import VideoProcessor
@@ -492,77 +497,68 @@ def build_report(job_id: str, results: Dict[str, Any]) -> Dict[str, Any]:
     low_risk = risk_summary.get("low", 0)
     avg_similarity = sum(d.get("similarity", 0) for d in detections) / max(total_detections, 1)
 
-    insights: List[str] = []
-    if high_risk > 0:
-        insights.append(
-            f"CRITICAL: {high_risk} high-risk matches detected with similarity scores above 85%. Immediate action recommended."
-        )
-    if avg_similarity > 0.8:
-        insights.append(
-            f"High average similarity ({avg_similarity:.1%}) indicates potential widespread infringement across {total_detections} videos."
-        )
-    if total_detections > 5:
-        insights.append(f"Large-scale distribution detected: Content found on {total_detections} different videos/channels.")
-        top_channels: Dict[str, int] = {}
-        for detection in detections:
-            channel = detection.get("channel", "Unknown")
-            top_channels[channel] = top_channels.get(channel, 0) + 1
-        sorted_channels = sorted(top_channels.items(), key=lambda x: x[1], reverse=True)[:3]
-        for channel, count in sorted_channels:
-            insights.append(f"- {channel}: {count} match(es)")
-    if medium_risk > 0:
-        insights.append(f"{medium_risk} medium-risk matches (60-85% similarity) require review and potential action.")
-    if low_risk > 0:
-        insights.append(f"{low_risk} low-risk matches detected but may require monitoring.")
+    # Generate AI insights and recommendations using Gemini
+    api_key = os.environ.get("GEMINI_API_KEY")
 
-    recommendations: List[str] = []
-    if high_risk > 0:
-        recommendations.append("File DMCA takedown notices with YouTube for high-risk matches")
-        recommendations.append("Monitor infringing accounts for future uploads")
-    if total_detections > 3:
-        recommendations.append("Consider broader copyright protection measures")
-        recommendations.append("Implement automated monitoring for detected channels")
-    if avg_similarity > 0.75:
-        recommendations.append("Escalate to legal team for potential litigation")
-    recommendations.append("Re-scan this video periodically to track new instances")
+    if api_key:
+        try:
+            import google.generativeai as genai
 
-    return {
-        "job_id": job_id,
-        "generated_at": datetime.datetime.utcnow().isoformat(),
-        "original_video": {
-            "title": input_video.get("title", "Unknown"),
-            "channel": input_video.get("uploader", "Unknown"),
-            "url": input_video.get("url", ""),
-        },
-        "executive_summary": {
-            "total_matches": total_detections,
-            "high_risk": high_risk,
-            "medium_risk": medium_risk,
-            "low_risk": low_risk,
-            "average_similarity": round(avg_similarity, 4),
-            "risk_level": "CRITICAL"
-            if high_risk > 0
-            else "HIGH"
-            if medium_risk > 2
-            else "MEDIUM"
-            if medium_risk > 0
-            else "LOW",
-        },
-        "ai_insights": insights,
-        "recommendations": recommendations,
-        "detections": [
-            {
-                "rank": i + 1,
-                "title": detection.get("title", ""),
-                "channel": detection.get("channel", ""),
-                "similarity": detection.get("similarity", 0),
-                "risk": detection.get("risk", "low"),
-                "url": detection.get("url", ""),
-            }
-            for i, detection in enumerate(detections[:20])
-        ],
-    }
+            genai.configure(api_key=api_key)
 
+            model = genai.GenerativeModel("models/gemini-2.5-flash")
+
+            prompt = f"""
+            Analyze the following copyright detection results and provide professional insights and recommendations.
+
+            Original Video:
+            - Title: {input_video.get("title", "Unknown")}
+            - Channel: {input_video.get("uploader", "Unknown")}
+            - URL: {input_video.get("url", "")}
+
+            Detection Summary:
+            - Total matches: {total_detections}
+            - High risk: {high_risk}
+            - Medium risk: {medium_risk}
+            - Low risk: {low_risk}
+            - Average similarity: {avg_similarity:.1%}
+
+            Top 5 detections:
+            {[
+                f"- {d.get('title', '')} by {d.get('channel', '')} (similarity: {d.get('similarity', 0):.1%})"
+                for d in detections[:5]
+            ]}
+
+            Provide:
+            1. 3-5 key insights about the infringement patterns and risks
+            2. 3-5 actionable recommendations for the copyright holder
+
+            Format STRICTLY as JSON:
+            {{
+                "insights": ["..."],
+                "recommendations": ["..."]
+            }}
+            """
+
+            response = model.generate_content(prompt)
+
+            # safer JSON parsing
+            try:
+                ai_content = json.loads(response.text.strip())
+                insights = ai_content.get("insights", [])
+                recommendations = ai_content.get("recommendations", [])
+            except Exception:
+                insights = [response.text]
+                recommendations = []
+
+        except Exception as e:
+            print(f"Gemini API error: {e}")
+            insights = ["AI insights unavailable due to API error"]
+            recommendations = ["Contact support for AI-powered recommendations"]
+
+    else:
+        insights = ["GEMINI_API_KEY not configured"]
+        recommendations = ["Configure Gemini API key for AI insights"]
 @app.post("/api/precheck")
 def precheck(file: UploadFile = File(...)):
     # Mocking precheck response for POC

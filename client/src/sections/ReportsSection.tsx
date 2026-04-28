@@ -6,7 +6,8 @@ import {
 } from 'recharts'
 import type { Detection, MetricCard as MetricCardType, RiskSummary } from '../types'
 import { formatViews, getRiskColor } from '../lib/utils'
-import { Download, Calendar, Bot, Loader2, AlertCircle, TrendingUp, BarChart2, PieChart as PieIcon, Activity } from 'lucide-react'
+import { Download, Calendar, Bot, Loader2, AlertCircle, TrendingUp, BarChart2, PieChart as PieIcon, Activity, Maximize2 } from 'lucide-react'
+import { ReportModal } from '../components/ReportModal'
 
 interface ReportsSectionProps {
   jobId: string
@@ -74,21 +75,44 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
   const [aiReport, setAiReport] = useState<any>(null)
   const [isGenerating, setIsGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false)
   const [dateRange, setDateRange] = useState('14d')
   const apiBase = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+
+  const fetchReport = async () => {
+    const res = await fetch(`${apiBase}/api/reports/${jobId}`)
+    if (!res.ok) {
+      throw new Error('Unable to fetch report')
+    }
+
+    const data = await res.json()
+    const isReportPayload = !!(data?.job_id && data?.executive_summary)
+    if (isReportPayload) {
+      setAiReport(data)
+      setStatusMessage(null)
+      return data
+    }
+
+    setAiReport(null)
+    setStatusMessage(data?.message || 'AI report not available yet.')
+    return null
+  }
 
   useEffect(() => {
     let isActive = true
     const loadReport = async () => {
       try {
-        const res = await fetch(`${apiBase}/api/reports/${jobId}`)
-        if (!res.ok) return
-        const data = await res.json()
-        if (isActive && !data.status) {
-          setAiReport(data)
+        const data = await fetchReport()
+        if (!isActive) return
+        if (!data && !statusMessage) {
+          setStatusMessage('AI report not available yet.')
         }
       } catch (err) {
         console.error('Failed to fetch report:', err)
+        if (isActive) {
+          setStatusMessage('Unable to fetch AI report.')
+        }
       }
     }
 
@@ -113,14 +137,21 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
   const handleGenerateReport = async () => {
     setIsGenerating(true)
     setError(null)
+    setStatusMessage(null)
     try {
       const res = await fetch(`${apiBase}/api/report/generate?job_id=${jobId}`, {
         method: 'POST',
       })
-      if (!res.ok) throw new Error('Failed to generate AI report')
-      setAiReport(await res.json())
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data?.detail || data?.error || 'Failed to generate AI report')
+      }
+
+      setStatusMessage('AI report generated successfully.')
+      await fetchReport()
     } catch (err: any) {
       setError(err.message)
+      setAiReport(null)
     } finally {
       setIsGenerating(false)
     }
@@ -236,6 +267,16 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
             <Download className="w-4 h-4 text-[#52525B]" />
             Export CSV
           </button>
+          {aiReport && (
+            <button
+              onClick={() => setIsReportModalOpen(true)}
+              className="flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-semibold text-white transition-all"
+              style={{ background: 'linear-gradient(135deg, #2DD4BF, #14B8A6)', boxShadow: '0 0 20px rgba(45,212,191,0.3)' }}
+            >
+              <Maximize2 className="w-4 h-4" />
+              View Report
+            </button>
+          )}
           <button
             onClick={handleGenerateReport}
             disabled={isGenerating}
@@ -252,6 +293,32 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
         <div className="p-4 rounded-xl flex items-center gap-3 bg-red-500/8 border border-red-500/20">
           <AlertCircle className="w-4 h-4 text-red-500" />
           <p className="text-sm text-red-400">{error}</p>
+        </div>
+      )}
+
+      {statusMessage && !aiReport && (
+        <div className="p-4 rounded-xl bg-white/5 border border-white/10 text-sm text-[#A1A1AA] space-y-2">
+          <p>{statusMessage}</p>
+          {statusMessage === 'AI report generated successfully.' && (
+            <button
+              onClick={async () => {
+                setIsGenerating(true)
+                setError(null)
+                setStatusMessage('Refreshing report...')
+                try {
+                  await fetchReport()
+                } catch (err: any) {
+                  setError(err.message)
+                  setStatusMessage(null)
+                } finally {
+                  setIsGenerating(false)
+                }
+              }}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[#6366F1] text-white text-sm"
+            >
+              Refresh Report
+            </button>
+          )}
         </div>
       )}
 
@@ -587,6 +654,14 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
           </table>
         </div>
       </div>
+
+      {/* ── Report Modal ── */}
+      <ReportModal 
+        isOpen={isReportModalOpen}
+        report={aiReport}
+        onClose={() => setIsReportModalOpen(false)}
+        onExport={handleExportCSV}
+      />
     </section>
   )
 }
