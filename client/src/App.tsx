@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { AuthProvider, useAuth } from './contexts/AuthContext'
 import { Sidebar } from './components/Sidebar'
 import { TopNav } from './components/TopNav'
 import { HeroSection } from './sections/HeroSection'
@@ -16,8 +17,12 @@ import type { Detection } from './types'
 import { LoadingScreen } from './components/LoadingScreen'
 import { InsightModal } from './components/InsightModal'
 import type { RadarNodeType } from './components/IntelligenceRadar'
+import { LoginPage } from './pages/LoginPage'
+import { RegisterPage } from './pages/RegisterPage'
 
-export default function App() {
+function AppContent() {
+  const { token, isLoading } = useAuth()
+  const [authPage, setAuthPage] = useState<'login' | 'register'>('login')
   const [activePage, setActivePage] = useState('dashboard')
   const [selectedDetection, setSelectedDetection] = useState<Detection | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
@@ -29,6 +34,17 @@ export default function App() {
 
   const { status, progress } = useJobStatus(jobId)
   const { results } = useJobResults(jobId, status)
+
+  // Auth gate
+  if (isLoading) {
+    return <LoadingScreen onComplete={() => {}} />
+  }
+  if (!token) {
+    if (authPage === 'register') {
+      return <RegisterPage onNavigateToLogin={() => setAuthPage('login')} />
+    }
+    return <LoginPage onNavigateToRegister={() => setAuthPage('register')} />
+  }
 
   const handleSelectDetection = (d: Detection) => {
     setSelectedDetection((prev) => (prev?.id === d.id ? null : d))
@@ -51,7 +67,7 @@ export default function App() {
     if (activePage === 'assets') {
       return (
         <main className="flex-1 px-8 pb-12 animate-fade-in" style={{ paddingTop: 88, height: '100vh' }}>
-          <AssetsSection 
+          <AssetsSection
             assets={assets}
             onAddAsset={(asset) => setAssets([...assets, asset])}
             onRemoveAsset={(id) => setAssets(assets.filter(a => a.id !== id))}
@@ -89,7 +105,6 @@ export default function App() {
       )
     }
 
-    // Finished Job Routing
     return (
       <main className="flex-1 px-8 pb-8 flex flex-col animate-fade-in h-screen" style={{ paddingTop: 88 }}>
         {activePage === 'dashboard' && (
@@ -112,7 +127,7 @@ export default function App() {
         )}
 
         {activePage === 'detections' && (
-          <DetectionsSection 
+          <DetectionsSection
             detections={results.detections}
             selectedDetection={selectedDetection}
             onSelectDetection={handleSelectDetection}
@@ -162,5 +177,13 @@ export default function App() {
         riskSummary={results?.risk_summary}
       />
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
   )
 }
