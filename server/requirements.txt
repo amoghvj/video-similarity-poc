@@ -13,3 +13,6 @@ python-dotenv
 google-genai
 google-cloud-aiplatform
 psycopg2-binary
+APScheduler>=3.10
+PyJWT>=2.8
+passlib[bcrypt]>=1.7.4
