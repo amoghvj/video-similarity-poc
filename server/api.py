@@ -92,6 +92,9 @@ def get_db_pool() -> pool.SimpleConnectionPool:
                 cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_checked TIMESTAMPTZ")
                 cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'idle'")
             conn.commit()
+        except Exception as e:
+            print(f"[DB] Initial migrations failed (can be ignored if schema matches): {e}")
+            conn.rollback()
         finally:
             _db_pool.putconn(conn)
     return _db_pool
@@ -348,16 +351,15 @@ def get_asset_db(asset_id: str, user_id: Optional[str] = None) -> Optional[Dict[
 
 def create_asset_db(url: str, title: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     asset_id = str(uuid.uuid4())
-    org_id = os.getenv("DEFAULT_ORG_ID", "org-default")
     with db_cursor() as cursor:
         cursor.execute(
             """
             INSERT INTO assets
-                (id, url, source_url, title, org_id, platform, fingerprint_status, embedding_dim, created_at, user_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                (id, url, title, added_at, status, user_id)
+            VALUES (%s, %s, %s, NOW(), %s, %s)
             RETURNING *
             """,
-            (asset_id, url, url, title, org_id, "youtube", "pending", 3072, user_id),
+            (asset_id, url, title, "pending", user_id),
         )
         return serialize_asset(cursor.fetchone())
 
@@ -530,13 +532,18 @@ def unschedule_asset_job(asset_id: str) -> None:
 
 def reload_scheduled_jobs() -> None:
     """Re-register all active scheduled assets on server startup."""
-    with db_cursor() as cursor:
-        cursor.execute(
-            "SELECT id, url, source_url, monitoring_frequency FROM assets WHERE monitoring_frequency IS NOT NULL"
-        )
-        rows = cursor.fetchall() or []
+    try:
+        with db_cursor() as cursor:
+            cursor.execute(
+                "SELECT id, url, monitoring_frequency FROM assets WHERE monitoring_frequency IS NOT NULL"
+            )
+            rows = cursor.fetchall() or []
+    except Exception as e:
+        print(f"[Scheduler] Failed to reload scheduled jobs (ignoring for graceful startup): {e}")
+        return
+
     for row in rows:
-        asset_url = row.get("url") or row.get("source_url") or ""
+        asset_url = row.get("url") or ""
         freq_raw = row["monitoring_frequency"]
         # Convert integer hours back to "Xh" key for FREQ_TO_HOURS lookup
         freq_str = _HOURS_TO_FREQ.get(int(freq_raw), "24h") if freq_raw else "24h"
