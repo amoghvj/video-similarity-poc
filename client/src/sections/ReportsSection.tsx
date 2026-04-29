@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts'
-import type { Detection, MetricCard as MetricCardType, RiskSummary } from '../types'
+import type { Detection, RiskSummary } from '../types'
 import { formatViews, getRiskColor } from '../lib/utils'
 import { Download, Calendar, Bot, Loader2, AlertCircle, TrendingUp, BarChart2, PieChart as PieIcon, Activity, Maximize2 } from 'lucide-react'
 import { ReportModal } from '../components/ReportModal'
@@ -12,14 +12,12 @@ import { ReportModal } from '../components/ReportModal'
 interface ReportsSectionProps {
   jobId: string
   detections: Detection[]
-  metrics: MetricCardType[]
   riskSummary: RiskSummary
 }
 
 // Build 14-day mock trend data from real detections
 function buildTrendData(detections: Detection[], riskSummary: RiskSummary) {
   const days = ['Apr 14', 'Apr 15', 'Apr 16', 'Apr 17', 'Apr 18', 'Apr 19', 'Apr 20', 'Apr 21', 'Apr 22', 'Apr 23', 'Apr 24', 'Apr 25', 'Apr 26', 'Apr 27']
-  const total = riskSummary.high + riskSummary.medium + riskSummary.low
   return days.map((day, i) => {
     const factor = 0.2 + (i / days.length) * 0.8 + Math.sin(i * 0.8) * 0.1
     return {
@@ -58,30 +56,25 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   )
 }
 
-// Animated counter
-function Counter({ target, prefix = '', suffix = '' }: { target: number; prefix?: string; suffix?: string }) {
-  return (
-    <motion.span
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      transition={{ duration: 0.5 }}
-    >
-      {prefix}{target.toLocaleString()}{suffix}
-    </motion.span>
-  )
-}
 
-export function ReportsSection({ jobId, detections, metrics, riskSummary }: ReportsSectionProps) {
+export function ReportsSection({ jobId, detections, riskSummary }: ReportsSectionProps) {
   const [aiReport, setAiReport] = useState<any>(null)
   const [isGenerating, setIsGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [isReportModalOpen, setIsReportModalOpen] = useState(false)
   const [dateRange, setDateRange] = useState('14d')
-  const apiBase = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+  const apiBase = import.meta.env.VITE_API_BASE
+
+  const getAuthHeader = (): Record<string, string> => {
+    const token = localStorage.getItem('vg_token')
+    return token ? { Authorization: `Bearer ${token}` } : {}
+  }
 
   const fetchReport = async () => {
-    const res = await fetch(`${apiBase}/api/reports/${jobId}`)
+    const res = await fetch(`${apiBase}/api/reports/${jobId}`, {
+      headers: { ...getAuthHeader() },
+    })
     if (!res.ok) {
       throw new Error('Unable to fetch report')
     }
@@ -157,6 +150,7 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
       setStatusMessage(messages[0])
       const res = await fetch(`${apiBase}/api/report/generate?job_id=${jobId}`, {
         method: 'POST',
+        headers: { ...getAuthHeader() },
       })
       const data = await res.json()
       if (!res.ok) {
@@ -198,7 +192,7 @@ export function ReportsSection({ jobId, detections, metrics, riskSummary }: Repo
     // Build CSV content
     const csvContent = [
       headers.join(','),
-      ...rows.map(row => row.join(','))
+      ...rows.map((row: string[]) => row.join(','))
     ].join('\n')
 
     // Add report summary at top if AI report exists

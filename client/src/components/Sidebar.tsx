@@ -9,12 +9,13 @@ import {
   Camera,
   MessageSquare,
   ChevronRight,
-  Eye,
   User,
   Archive,
+  LogOut,
 } from 'lucide-react'
 
 import { Logo } from './Logo'
+import { useAuth } from '../contexts/AuthContext'
 
 interface SidebarProps {
   activePage: string
@@ -38,6 +39,7 @@ const platforms = [
 ]
 
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
+  const { user, logout } = useAuth()
   return (
     <aside
       style={{
@@ -137,10 +139,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
         className="px-3 py-4"
         style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}
       >
-        <button
-          id="user-profile-btn"
-          className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-150 hover:bg-white/5"
-        >
+        <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg">
           <div
             className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
             style={{ background: 'linear-gradient(135deg, #6366F1, #8B5CF6)' }}
@@ -148,10 +147,22 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             <User className="w-4 h-4 text-white" />
           </div>
           <div className="flex-1 text-left overflow-hidden">
-            <p className="text-sm font-medium truncate" style={{ color: '#E4E4E7' }}>Navdeep R.</p>
-            <p className="text-[11px] truncate" style={{ color: '#71717A' }}>navdeep@framelock.ai</p>
+            <p className="text-sm font-medium truncate" style={{ color: '#E4E4E7' }}>
+              {user?.displayName ?? '—'}
+            </p>
+            <p className="text-[11px] truncate" style={{ color: '#71717A' }}>
+              {user?.email ?? ''}
+            </p>
           </div>
-        </button>
+          <button
+            onClick={logout}
+            title="Sign out"
+            className="p-1.5 rounded-lg transition-colors hover:bg-white/10"
+            style={{ color: '#71717A' }}
+          >
+            <LogOut className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
     </aside>
   )

@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { X, AlertTriangle, Activity, FileBarChart2, Eye, Zap, TrendingUp, Flag, CheckCircle2, Download, Bot } from 'lucide-react'
 import type { RadarNodeType } from './IntelligenceRadar'
 import type { Detection, PropagationNode, RiskSummary } from '../types'
-import { getRiskColor, formatViews } from '../lib/utils'
+import { formatViews } from '../lib/utils'
 
 interface InsightModalProps {
   isOpen: boolean
@@ -226,11 +226,11 @@ export function InsightModal({ isOpen, type, onClose, detections, propagationNod
   const renderContent = () => {
     if (!type) return null
     switch (type) {
-      case 'high-risk': return <HighRiskContent detections={detections} />
-      case 'medium-risk': return <MediumRiskContent detections={detections} />
-      case 'propagation': return <PropagationContent nodes={propagationNodes} />
+      case 'high-risk': return <HighRiskContent detections={detections ?? []} />
+      case 'medium-risk': return <MediumRiskContent detections={detections ?? []} />
+      case 'propagation': return <PropagationContent nodes={propagationNodes ?? []} />
       case 'insights': return <InsightsContent riskSummary={riskSummary} />
-      case 'reports': return <ReportsContent detections={detections} riskSummary={riskSummary} />
+      case 'reports': return <ReportsContent detections={detections ?? []} riskSummary={riskSummary} />
       case 'anomalies': return <AnomaliesContent />
     }
   }

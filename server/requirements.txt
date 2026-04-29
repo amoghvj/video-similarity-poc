@@ -13,3 +13,7 @@ python-dotenv
 google-genai
 google-cloud-aiplatform
 psycopg2-binary
+APScheduler>=3.10
+PyJWT>=2.8
+passlib[argon2]>=1.7.4
+argon2-cffi>=21.3.0

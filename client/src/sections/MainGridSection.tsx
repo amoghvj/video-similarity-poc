@@ -1,4 +1,4 @@
-import { Card } from '../components/Card'
+
 import { DetectionItem } from '../components/DetectionItem'
 import { MetricCard } from '../components/MetricCard'
 import type { Detection, MetricCard as MetricCardType, RiskSummary } from '../types'

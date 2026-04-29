@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { motion, useAnimation, AnimatePresence } from 'framer-motion'
 import { AlertTriangle, Activity, FileBarChart2, Eye, Zap, TrendingUp } from 'lucide-react'
 
@@ -32,7 +32,6 @@ export function IntelligenceRadar({ highRiskCount = 0, mediumRiskCount = 0, onNo
   const counterControls = useAnimation()
   const [hoveredNode, setHoveredNode] = useState<number | null>(null)
   const [isHovered, setIsHovered] = useState(false)
-  const rotationRef = useRef(0)
 
   const nodes = RADAR_NODES.map(n => ({
     ...n,

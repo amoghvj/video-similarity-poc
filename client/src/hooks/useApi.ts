@@ -1,6 +1,11 @@
 import { useState, useEffect } from 'react'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE
+
+function getAuthHeader(): Record<string, string> {
+  const token = localStorage.getItem('vg_token')
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
 
 export function useAnalyze() {
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -12,8 +17,8 @@ export function useAnalyze() {
     try {
       const res = await fetch(`${API_BASE}/api/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, frames, threshold })
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body: JSON.stringify({ url, frames, threshold }),
       })
       if (!res.ok) throw new Error('Failed to start analysis')
       const data = await res.json()
@@ -41,10 +46,12 @@ export function useJobStatus(jobId: string | null) {
 
     const poll = async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/analyze/${jobId}`)
+        const res = await fetch(`${API_BASE}/api/analyze/${jobId}`, {
+          headers: { ...getAuthHeader() },
+        })
         if (!res.ok) throw new Error('Failed to fetch status')
         const data = await res.json()
-        
+
         setStatus(data.status)
         setProgress(data.progress || {})
 
@@ -57,7 +64,7 @@ export function useJobStatus(jobId: string | null) {
       }
     }
 
-    poll() // Initial fetch
+    poll()
     interval = setInterval(poll, 2500)
 
     return () => clearInterval(interval)
@@ -77,7 +84,9 @@ export function useJobResults(jobId: string | null, status: string) {
     const fetchResults = async () => {
       setIsLoading(true)
       try {
-        const res = await fetch(`${API_BASE}/api/results/${jobId}`)
+        const res = await fetch(`${API_BASE}/api/results/${jobId}`, {
+          headers: { ...getAuthHeader() },
+        })
         if (!res.ok) throw new Error('Failed to fetch results')
         const data = await res.json()
         setResults(data)

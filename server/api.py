@@ -4,11 +4,15 @@ import datetime
 import time
 import uuid
 import json
+import subprocess
+import tempfile
+import shutil
+import threading
 from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Depends, Header, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -17,24 +21,31 @@ from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
 import google.generativeai as genai
 from dotenv import load_dotenv
+import jwt as pyjwt
+from passlib.context import CryptContext
+from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
 from src.analyzer import Analyzer
 from src.video_processor import VideoProcessor
+from src.search_service import SearchService
+from src.similarity_service import SimilarityService
+from src.vectorise import vectorise, VectorEmbedding
 
 app = FastAPI()
 
+
+# Read allowed CORS origin from environment variable
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-from dotenv import load_dotenv
-load_dotenv()
 
 def get_env(name: str) -> str:
     value = os.getenv(name)
@@ -42,13 +53,21 @@ def get_env(name: str) -> str:
         raise RuntimeError(f"Missing env variable: {name}")
     return value
 
+
 DB_HOST = get_env("DB_HOST")
 DB_PORT = int(get_env("DB_PORT"))
 DB_NAME = get_env("DB_NAME")
 DB_USER = get_env("DB_USER")
 DB_PASS = get_env("DB_PASS")
-_db_pool: Optional[pool.SimpleConnectionPool] = None
+JWT_SECRET = get_env("JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
 
+_db_pool: Optional[pool.SimpleConnectionPool] = None
+_scheduler: Optional[BackgroundScheduler] = None
+
+
+# ─── Database ────────────────────────────────────────────────────────────────
 
 def get_db_pool() -> pool.SimpleConnectionPool:
     global _db_pool
@@ -63,6 +82,18 @@ def get_db_pool() -> pool.SimpleConnectionPool:
             password=DB_PASS,
             connect_timeout=5,
         )
+        # Ensure schema migrations (safe re-runs) using a connection from the pool
+        conn = _db_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS user_id UUID")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_scan_job_id UUID")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS url TEXT")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_checked TIMESTAMPTZ")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'idle'")
+            conn.commit()
+        finally:
+            _db_pool.putconn(conn)
     return _db_pool
 
 
@@ -98,6 +129,17 @@ def init_db() -> None:
         )
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                hashed_password TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS assets (
                 id UUID PRIMARY KEY,
                 url TEXT NOT NULL,
@@ -109,7 +151,16 @@ def init_db() -> None:
             )
             """
         )
+        # Additive migrations — safe to re-run
+        cursor.execute(
+            "ALTER TABLE assets ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE"
+        )
+        cursor.execute(
+            "ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_scan_job_id UUID REFERENCES jobs(id) ON DELETE SET NULL"
+        )
 
+
+# ─── Serializers ─────────────────────────────────────────────────────────────
 
 def parse_iso_datetime(value: Optional[str]) -> Optional[datetime.datetime]:
     if not value:
@@ -121,7 +172,7 @@ def parse_iso_datetime(value: Optional[str]) -> Optional[datetime.datetime]:
 def parse_uuid(value: str) -> Optional[uuid.UUID]:
     try:
         return uuid.UUID(value)
-    except ValueError:
+    except (ValueError, AttributeError):
         return None
 
 
@@ -136,17 +187,43 @@ def serialize_job(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_HOURS_TO_FREQ = {1: "1h", 2: "2h", 6: "6h", 24: "24h"}
+
+
 def serialize_asset(row: Dict[str, Any]) -> Dict[str, Any]:
+    freq_raw = row.get("monitoring_frequency")
+    if isinstance(freq_raw, int):
+        freq = _HOURS_TO_FREQ.get(freq_raw, str(freq_raw) + "h")
+    elif isinstance(freq_raw, str) and freq_raw.isdigit():
+        freq = _HOURS_TO_FREQ.get(int(freq_raw), freq_raw + "h")
+    else:
+        freq = freq_raw  # already "1h" / None
+
+    last_checked = row.get("last_checked")
+    added_at = row.get("created_at") or row.get("added_at")
+
     return {
         "id": str(row["id"]),
-        "url": row["url"],
+        "url": row.get("url") or row.get("source_url") or "",
         "title": row["title"],
-        "addedAt": row["added_at"].isoformat() if row.get("added_at") else None,
-        "monitoringFrequency": row.get("monitoring_frequency"),
-        "lastChecked": row["last_checked"].isoformat() if row.get("last_checked") else None,
-        "status": row.get("status", "idle"),
+        "addedAt": added_at.isoformat() if added_at else None,
+        "monitoringFrequency": freq,
+        "lastChecked": last_checked.isoformat() if last_checked else None,
+        "status": row.get("status") or row.get("fingerprint_status") or "idle",
+        "lastScanJobId": str(row["last_scan_job_id"]) if row.get("last_scan_job_id") else None,
     }
 
+
+def serialize_user(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "email": row["email"],
+        "displayName": row["display_name"],
+        "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
+
+
+# ─── Job DB helpers ──────────────────────────────────────────────────────────
 
 def create_job(job_id: str, status: str, progress: Dict[str, Any]) -> Dict[str, Any]:
     with db_cursor() as cursor:
@@ -213,89 +290,280 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
         return serialize_job(row) if row else None
 
 
-def list_assets_db() -> List[Dict[str, Any]]:
+# ─── User DB helpers ──────────────────────────────────────────────────────────
+
+def create_user_db(email: str, hashed_password: str, display_name: str) -> Dict[str, Any]:
+    user_id = uuid.uuid4()
     with db_cursor() as cursor:
-        cursor.execute("SELECT * FROM assets ORDER BY added_at DESC")
+        cursor.execute(
+            """
+            INSERT INTO users (id, email, hashed_password, display_name)
+            VALUES (%s, %s, %s, %s)
+            RETURNING *
+            """,
+            (str(user_id), email, hashed_password, display_name),
+        )
+        return serialize_user(cursor.fetchone())
+
+
+def get_user_by_email_db(email: str) -> Optional[Dict[str, Any]]:
+    with db_cursor() as cursor:
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {**serialize_user(row), "hashed_password": row["hashed_password"]}
+
+
+# ─── Asset DB helpers ─────────────────────────────────────────────────────────
+
+def list_assets_db(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    with db_cursor() as cursor:
+        if user_id:
+            cursor.execute(
+                "SELECT * FROM assets WHERE user_id = %s ORDER BY created_at DESC",
+                (user_id,),
+            )
+        else:
+            cursor.execute("SELECT * FROM assets ORDER BY created_at DESC")
         rows = cursor.fetchall() or []
         return [serialize_asset(row) for row in rows]
 
 
-def get_asset_db(asset_id: str) -> Optional[Dict[str, Any]]:
+def get_asset_db(asset_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     parsed_id = parse_uuid(asset_id)
     if not parsed_id:
         return None
     with db_cursor() as cursor:
-        cursor.execute("SELECT * FROM assets WHERE id = %s", (str(parsed_id),))
+        if user_id:
+            cursor.execute(
+                "SELECT * FROM assets WHERE id = %s AND user_id = %s",
+                (str(parsed_id), user_id),
+            )
+        else:
+            cursor.execute("SELECT * FROM assets WHERE id = %s", (str(parsed_id),))
         row = cursor.fetchone()
         return serialize_asset(row) if row else None
 
 
-def create_asset_db(url: str, title: str) -> Dict[str, Any]:
-    asset_id = uuid.uuid4()
+def create_asset_db(url: str, title: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    asset_id = str(uuid.uuid4())
+    org_id = os.getenv("DEFAULT_ORG_ID", "org-default")
     with db_cursor() as cursor:
         cursor.execute(
             """
-            INSERT INTO assets (id, url, title)
-            VALUES (%s, %s, %s)
+            INSERT INTO assets
+                (id, url, source_url, title, org_id, platform, fingerprint_status, embedding_dim, created_at, user_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             RETURNING *
             """,
-            (str(asset_id), url, title),
+            (asset_id, url, url, title, org_id, "youtube", "pending", 3072, user_id),
         )
         return serialize_asset(cursor.fetchone())
 
 
-def update_asset_db(asset_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_asset_db(
+    asset_id: str,
+    updates: Dict[str, Any],
+    user_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     fields: List[str] = []
     values: List[Any] = []
 
     if "monitoringFrequency" in updates:
         fields.append("monitoring_frequency = %s")
-        values.append(updates["monitoringFrequency"])
+        freq_val = updates["monitoringFrequency"]
+        # DB column is integer (hours); frontend sends "1h"/"2h" etc.
+        if isinstance(freq_val, str) and freq_val.endswith("h") and freq_val[:-1].isdigit():
+            freq_val = int(freq_val[:-1])
+        values.append(freq_val)
     if "lastChecked" in updates:
         fields.append("last_checked = %s")
         values.append(updates["lastChecked"])
     if "status" in updates:
         fields.append("status = %s")
         values.append(updates["status"])
+    if "lastScanJobId" in updates:
+        fields.append("last_scan_job_id = %s")
+        values.append(updates["lastScanJobId"])
 
     if not fields:
-        return get_asset_db(asset_id)
+        return get_asset_db(asset_id, user_id)
 
     parsed_id = parse_uuid(asset_id)
     if not parsed_id:
         return None
-    values.append(str(parsed_id))
+
+    if user_id:
+        values.extend([str(parsed_id), user_id])
+        where = "WHERE id = %s AND user_id = %s"
+    else:
+        values.append(str(parsed_id))
+        where = "WHERE id = %s"
 
     with db_cursor() as cursor:
         cursor.execute(
-            f"UPDATE assets SET {', '.join(fields)} WHERE id = %s RETURNING *",
+            f"UPDATE assets SET {', '.join(fields)} {where} RETURNING *",
             values,
         )
         row = cursor.fetchone()
         return serialize_asset(row) if row else None
 
 
-def delete_asset_db(asset_id: str) -> Optional[Dict[str, Any]]:
+def delete_asset_db(asset_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     parsed_id = parse_uuid(asset_id)
     if not parsed_id:
         return None
     with db_cursor() as cursor:
-        cursor.execute("DELETE FROM assets WHERE id = %s RETURNING *", (str(parsed_id),))
+        if user_id:
+            cursor.execute(
+                "DELETE FROM assets WHERE id = %s AND user_id = %s RETURNING *",
+                (str(parsed_id), user_id),
+            )
+        else:
+            cursor.execute("DELETE FROM assets WHERE id = %s RETURNING *", (str(parsed_id),))
         row = cursor.fetchone()
         return serialize_asset(row) if row else None
 
 
+# ─── Auth utilities ───────────────────────────────────────────────────────────
+
+_pwd_ctx = None
+
+
+def get_pwd_ctx():
+    global _pwd_ctx
+    if _pwd_ctx is None:
+        _pwd_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
+    return _pwd_ctx
+
+
+def hash_password(plain: str) -> str:
+    return get_pwd_ctx().hash(plain)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return get_pwd_ctx().verify(plain, hashed)
+
+
+def create_access_token(user_id: str, email: str, display_name: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "name": display_name,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXPIRY_HOURS),
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    try:
+        return pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_current_user(authorization: str = Header(...)) -> Dict[str, Any]:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization.split(" ", 1)[1]
+    return decode_token(token)
+
+
+# ─── Scheduler ───────────────────────────────────────────────────────────────
+
+FREQ_TO_HOURS: Dict[str, int] = {"1h": 1, "2h": 2, "6h": 6, "24h": 24}
+
+
+def get_scheduler() -> BackgroundScheduler:
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler(daemon=True)
+    return _scheduler
+
+
+def run_scheduled_asset_scan(asset_id: str, asset_url: str) -> None:
+    """Runs a full similarity scan for an asset. Called by APScheduler."""
+    job_id = str(uuid.uuid4())
+    create_job(job_id, "pending", {"stage": "queued", "percent": 0, "details": "Scheduled scan queued"})
+    update_asset_db(asset_id, {"status": "checking"})
+    try:
+        req = AnalyzeRequest(url=asset_url)
+        run_analysis_task(job_id, req)
+        update_asset_db(asset_id, {
+            "lastChecked": datetime.datetime.utcnow().isoformat(),
+            "status": "active",
+            "lastScanJobId": job_id,
+        })
+    except Exception as exc:
+        print(f"[Scheduler] Scan failed for asset {asset_id}: {exc}")
+        update_asset_db(asset_id, {"status": "active"})
+
+
+def schedule_asset_job(asset_id: str, asset_url: str, frequency: str) -> None:
+    scheduler = get_scheduler()
+    job_key = f"asset_{asset_id}"
+    hours = FREQ_TO_HOURS.get(frequency, 24)
+    if scheduler.get_job(job_key):
+        scheduler.remove_job(job_key)
+    scheduler.add_job(
+        run_scheduled_asset_scan,
+        trigger="interval",
+        hours=hours,
+        id=job_key,
+        args=[asset_id, asset_url],
+        replace_existing=True,
+        max_instances=1,
+    )
+    print(f"[Scheduler] Scheduled asset {asset_id} every {hours}h")
+
+
+def unschedule_asset_job(asset_id: str) -> None:
+    scheduler = get_scheduler()
+    job_key = f"asset_{asset_id}"
+    if scheduler.get_job(job_key):
+        scheduler.remove_job(job_key)
+        print(f"[Scheduler] Removed schedule for asset {asset_id}")
+
+
+def reload_scheduled_jobs() -> None:
+    """Re-register all active scheduled assets on server startup."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT id, url, source_url, monitoring_frequency FROM assets WHERE monitoring_frequency IS NOT NULL"
+        )
+        rows = cursor.fetchall() or []
+    for row in rows:
+        asset_url = row.get("url") or row.get("source_url") or ""
+        freq_raw = row["monitoring_frequency"]
+        # Convert integer hours back to "Xh" key for FREQ_TO_HOURS lookup
+        freq_str = _HOURS_TO_FREQ.get(int(freq_raw), "24h") if freq_raw else "24h"
+        schedule_asset_job(str(row["id"]), asset_url, freq_str)
+    print(f"[Scheduler] Reloaded {len(rows)} scheduled asset jobs")
+
+
+# ─── App lifecycle ────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    get_scheduler().start()
+    reload_scheduled_jobs()
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
     global _db_pool
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
     if _db_pool is not None:
         _db_pool.closeall()
         _db_pool = None
+
+
+# ─── Pydantic models ──────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     url: str
@@ -314,7 +582,21 @@ class AssetUpdateRequest(BaseModel):
     lastChecked: str | None = None
     status: str | None = None
 
-def run_analysis_task(job_id: str, req: AnalyzeRequest):
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    displayName: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+# ─── Analysis pipeline ───────────────────────────────────────────────────────
+
+def run_analysis_task(job_id: str, req: AnalyzeRequest) -> None:
     update_job(
         job_id,
         status="active",
@@ -325,22 +607,19 @@ def run_analysis_task(job_id: str, req: AnalyzeRequest):
             n_frames=req.frames,
             m_frames=req.candidate_frames,
             threshold=req.threshold,
-            max_candidates=10 # Search for 10 candidate videos
+            max_candidates=10,
         )
         update_job(
             job_id,
             progress={"stage": "detecting", "percent": 50, "details": "Analyzing candidates..."},
         )
-        
+
         raw_results = analyzer.run(req.url)
-        
-        # Map raw results to the JSON schema defined in docs
-        
-        # Risk Distribution Logic
+
         high_risk = 0
         med_risk = 0
         low_risk = 0
-        
+
         detections = []
         propagation_nodes = [
             {
@@ -351,10 +630,10 @@ def run_analysis_task(job_id: str, req: AnalyzeRequest):
                 "similarity": 1.0,
                 "x": 50,
                 "y": 50,
-                "connections": []
+                "connections": [],
             }
         ]
-        
+
         for c in raw_results.get("candidates", []):
             sim = c["max_similarity"]
             if sim >= 0.85:
@@ -366,7 +645,7 @@ def run_analysis_task(job_id: str, req: AnalyzeRequest):
             else:
                 risk = "low"
                 low_risk += 1
-                
+
             det_id = str(uuid.uuid4())
             detections.append({
                 "id": det_id,
@@ -379,18 +658,18 @@ def run_analysis_task(job_id: str, req: AnalyzeRequest):
                 "platform": "youtube",
                 "uploadedAt": "2024-03-20T12:00:00Z",
                 "duration": "10:00",
-                "url": c["url"]
+                "url": c["url"],
             })
-            
+
             propagation_nodes.append({
                 "id": det_id,
                 "title": c["title"][:20] + "...",
                 "views": int(10000 * float(sim)),
                 "risk": risk,
                 "similarity": float(sim),
-                "x": 0, # Frontend will handle force layout or ignore these
+                "x": 0,
                 "y": 0,
-                "connections": ["original"]
+                "connections": ["original"],
             })
             propagation_nodes[0]["connections"].append(det_id)
 
@@ -404,67 +683,86 @@ def run_analysis_task(job_id: str, req: AnalyzeRequest):
                 "resolution": "1080p",
                 "uploadedAt": "2024-03-27T10:00:00Z",
                 "platform": "youtube",
-                "channel": raw_results["input_video"].get("uploader", "Unknown Channel")
+                "channel": raw_results["input_video"].get("uploader", "Unknown Channel"),
             },
             "fingerprint": {
                 "id": f"FP-{uuid.uuid4().hex[:8].upper()}",
                 "framesAnalyzed": raw_results["n_frames"],
                 "model": "CLIP ViT-B/32",
-                "createdAt": "2024-03-27T10:05:00Z"
+                "createdAt": "2024-03-27T10:05:00Z",
             },
             "risk_summary": {
                 "high": high_risk,
                 "medium": med_risk,
-                "low": low_risk
+                "low": low_risk,
             },
             "metrics": [
-                {
-                    "label": "Total Reach Impact",
-                    "value": "2.4M",
-                    "change": "+12.4%",
-                    "positive": False
-                },
-                {
-                    "label": "Estimated Revenue Loss",
-                    "value": "$14,200",
-                    "change": "+8.1%",
-                    "positive": False
-                },
-                {
-                    "label": "Candidate Key",
-                    "value": f"{len(detections)}",
-                    "change": f"Frame matches: {len(detections)}",
-                    "positive": True
-                }
+                {"label": "Total Reach Impact", "value": "2.4M", "change": "+12.4%", "positive": False},
+                {"label": "Estimated Revenue Loss", "value": "$14,200", "change": "+8.1%", "positive": False},
+                {"label": "Candidate Key", "value": f"{len(detections)}", "change": f"Frame matches: {len(detections)}", "positive": True},
             ],
             "detections": detections,
-            "propagation_nodes": propagation_nodes
+            "propagation_nodes": propagation_nodes,
         }
-        
+
         update_job(
             job_id,
             status="completed",
             progress={"stage": "done", "percent": 100, "details": "Analysis complete"},
             results=mapped_results,
         )
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         update_job(job_id, status="failed", error=str(e))
 
 
+# ─── Auth endpoints ───────────────────────────────────────────────────────────
+
+@app.post("/api/auth/register")
+def register(req: RegisterRequest):
+    existing = get_user_by_email_db(req.email)
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed = hash_password(req.password)
+    user = create_user_db(req.email, hashed, req.displayName)
+    token = create_access_token(user["id"], user["email"], user["displayName"])
+    return {"token": token, "user": user}
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    user = get_user_by_email_db(req.email)
+    # Same error for missing user and wrong password to avoid enumeration
+    if not user or not verify_password(req.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(user["id"], user["email"], user["displayName"])
+    return {"token": token, "user": {k: v for k, v in user.items() if k != "hashed_password"}}
+
+
+@app.get("/api/auth/me")
+def me(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return {
+        "id": current_user["sub"],
+        "email": current_user["email"],
+        "displayName": current_user["name"],
+    }
+
+
+# ─── Analysis endpoints ───────────────────────────────────────────────────────
+
 @app.post("/api/analyze")
-def start_analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
+def start_analyze(req: AnalyzeRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     job_id = str(uuid.uuid4())
     create_job(job_id, "pending", {"stage": "queued", "percent": 0, "details": "Job queued"})
-    import threading
-    t = threading.Thread(target=run_analysis_task, args=(job_id, req))
+    t = threading.Thread(target=run_analysis_task, args=(job_id, req), daemon=True)
     t.start()
     return {"job_id": job_id, "status": "pending", "message": "Analysis started successfully"}
 
+
 @app.get("/api/analyze/{job_id}")
-def get_status(job_id: str):
+def get_status(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -475,16 +773,18 @@ def get_status(job_id: str):
         "error": job.get("error"),
     }
 
+
 @app.get("/api/results/{job_id}")
-def get_results(job_id: str):
+def get_results(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "completed":
         return {"status": job["status"], "message": "Job not completed yet"}
-
     return job.get("results")
 
+
+# ─── Report generation ────────────────────────────────────────────────────────
 
 def build_report(job_id: str, results: Dict[str, Any]) -> Dict[str, Any]:
     detections = results.get("detections", [])
@@ -497,24 +797,19 @@ def build_report(job_id: str, results: Dict[str, Any]) -> Dict[str, Any]:
     low_risk = risk_summary.get("low", 0)
     avg_similarity = sum(d.get("similarity", 0) for d in detections) / max(total_detections, 1)
 
-    # Generate AI insights and recommendations using Gemini
     api_key = os.environ.get("GEMINI_API_KEY")
 
     if api_key:
         try:
             import google.generativeai as genai
-
             genai.configure(api_key=api_key)
-
             model = genai.GenerativeModel("models/gemini-2.5-flash")
-
             prompt = f"""
             Analyze the following copyright detection results and provide professional insights and recommendations.
 
             Original Video:
             - Title: {input_video.get("title", "Unknown")}
             - Channel: {input_video.get("uploader", "Unknown")}
-            - URL: {input_video.get("url", "")}
 
             Detection Summary:
             - Total matches: {total_detections}
@@ -539,10 +834,7 @@ def build_report(job_id: str, results: Dict[str, Any]) -> Dict[str, Any]:
                 "recommendations": ["..."]
             }}
             """
-
             response = model.generate_content(prompt)
-
-            # safer JSON parsing
             try:
                 ai_content = json.loads(response.text.strip())
                 insights = ai_content.get("insights", [])
@@ -550,55 +842,56 @@ def build_report(job_id: str, results: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 insights = [response.text]
                 recommendations = []
-
         except Exception as e:
             print(f"Gemini API error: {e}")
             insights = ["AI insights unavailable due to API error"]
             recommendations = ["Contact support for AI-powered recommendations"]
-
     else:
         insights = ["GEMINI_API_KEY not configured"]
         recommendations = ["Configure Gemini API key for AI insights"]
 
     return {
         "job_id": job_id,
-        "generated_at": datetime.datetime.now().isoformat(),
-        "original_video": input_video,
+        "generated_at": datetime.datetime.utcnow().isoformat(),
+        "original_video": {
+            "title": input_video.get("title", "Unknown"),
+            "channel": input_video.get("channel", "Unknown"),
+            "url": input_video.get("url", ""),
+        },
         "executive_summary": {
             "total_matches": total_detections,
             "high_risk": high_risk,
             "medium_risk": medium_risk,
             "low_risk": low_risk,
-            "risk_level": "CRITICAL" if high_risk > 5 else "HIGH" if high_risk > 0 else "MEDIUM" if medium_risk > 0 else "LOW",
-            "average_similarity": avg_similarity
+            "average_similarity": round(avg_similarity, 4),
+            "risk_level": (
+                "CRITICAL" if high_risk > 0
+                else "HIGH" if medium_risk > 2
+                else "MEDIUM" if medium_risk > 0
+                else "LOW"
+            ),
         },
         "ai_insights": insights,
         "recommendations": recommendations,
-        "detections": detections
-    }
-@app.post("/api/precheck")
-def precheck(file: UploadFile = File(...)):
-    # Mocking precheck response for POC
-    time.sleep(2)
-    return {
-        "status": "completed",
-        "safe_to_upload": False,
-        "conflicts": [
+        "detections": [
             {
-                "title": "Existing Copyrighted Video",
-                "url": "https://youtube.com/watch?v=123",
-                "similarity": 0.94
+                "rank": i + 1,
+                "title": d.get("title", ""),
+                "channel": d.get("channel", ""),
+                "similarity": d.get("similarity", 0),
+                "risk": d.get("risk", "low"),
+                "url": d.get("url", ""),
             }
-        ]
+            for i, d in enumerate(detections[:20])
+        ],
     }
 
+
 @app.post("/api/report/generate")
-def generate_report(job_id: str):
-    """Generate an AI-powered comprehensive report for a completed analysis."""
+def generate_report(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     job = get_job(job_id)
     if not job or job.get("status") != "completed":
         raise HTTPException(status_code=404, detail="Job not found or not completed")
-
     results = job.get("results", {})
     report = build_report(job_id, results)
     update_job(job_id, report=report)
@@ -606,30 +899,156 @@ def generate_report(job_id: str):
 
 
 @app.get("/api/reports/{job_id}")
-def get_report(job_id: str):
+def get_report(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     if job.get("report"):
         return job["report"]
     if job.get("status") != "completed":
         return {"status": job.get("status"), "message": "Job not completed yet"}
-
     results = job.get("results", {})
     report = build_report(job_id, results)
     update_job(job_id, report=report)
     return report
 
 
+# ─── Pre-upload check ─────────────────────────────────────────────────────────
+
+@app.post("/api/precheck")
+async def precheck(
+    file: UploadFile = File(...),
+    title: str = Form(None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    allowed_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    suffix = os.path.splitext(file.filename or "")[1].lower()
+    if suffix not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(allowed_extensions)}",
+        )
+
+    tmp_path: Optional[str] = None
+    try:
+        # Save uploaded file to a temp location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+
+        # Probe duration via ffprobe
+        duration = 60.0
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", tmp_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            duration = float(result.stdout.strip()) if result.stdout.strip() else 60.0
+        except Exception:
+            pass
+
+        # Determine search title
+        search_title = title or ""
+        if not search_title:
+            try:
+                result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format_tags=title",
+                     "-of", "csv=p=0", tmp_path],
+                    capture_output=True, text=True, timeout=15,
+                )
+                search_title = result.stdout.strip()
+            except Exception:
+                pass
+        if not search_title:
+            search_title = os.path.splitext(os.path.basename(file.filename or "video"))[0]
+
+        # Extract frames from local file using VideoProcessor (FFmpeg accepts local paths)
+        processor = VideoProcessor()
+        timestamps = processor.calculate_frame_timestamps(duration, n_frames=3)
+        from PIL import Image
+        frames = []
+        for ts in timestamps:
+            try:
+                frame = processor._grab_frame_at_timestamp(tmp_path, ts)
+                if frame:
+                    frames.append(frame)
+            except Exception:
+                pass
+
+        if not frames:
+            raise HTTPException(status_code=422, detail="Could not extract frames from video file")
+
+        # Build embeddings for the local file's frames
+        input_embedding = VectorEmbedding()
+        for frame in frames:
+            input_embedding.add(frame)
+        frame_vectors = input_embedding.get_vectors()
+
+        # Search YouTube candidates by title
+        candidates = SearchService(max_results=10).search_videos(search_title)
+
+        # Score candidates
+        similarity_service = SimilarityService()
+        high_risk = 0
+        med_risk = 0
+        low_risk = 0
+        detections = []
+
+        for c in candidates:
+            try:
+                candidate_vector = vectorise(c["url"], n_frames=0)
+                candidate_vectors = candidate_vector.get_vectors()
+                max_sim = similarity_service.compute_max_similarity(frame_vectors, candidate_vectors)
+                sim = float(max_sim)
+
+                if sim >= 0.85:
+                    risk = "high"
+                    high_risk += 1
+                elif sim >= 0.70:
+                    risk = "medium"
+                    med_risk += 1
+                else:
+                    risk = "low"
+                    low_risk += 1
+
+                detections.append({
+                    "id": str(uuid.uuid4()),
+                    "title": c["title"],
+                    "channel": c.get("uploader", "Unknown Channel"),
+                    "thumbnailUrl": c.get("thumbnail_url", ""),
+                    "similarity": round(sim, 4),
+                    "risk": risk,
+                    "platform": "youtube",
+                    "url": c["url"],
+                })
+            except Exception:
+                continue
+
+        detections.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return {
+            "status": "completed",
+            "safe_to_upload": high_risk == 0,
+            "searchTitle": search_title,
+            "riskSummary": {"high": high_risk, "medium": med_risk, "low": low_risk},
+            "detections": detections,
+        }
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+# ─── Video info ───────────────────────────────────────────────────────────────
+
 @app.get("/api/video-info")
-def get_video_info(url: str):
+def get_video_info(url: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
         processor = VideoProcessor()
         info = processor.get_video_info(url)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     return {
         "id": info.get("id", ""),
         "title": info.get("title", "Unknown"),
@@ -640,21 +1059,23 @@ def get_video_info(url: str):
     }
 
 
+# ─── Asset endpoints ──────────────────────────────────────────────────────────
+
 @app.get("/api/assets")
-def list_assets():
-    return {"assets": list_assets_db()}
+def list_assets(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return {"assets": list_assets_db(user_id=current_user["sub"])}
 
 
 @app.get("/api/assets/{asset_id}")
-def get_asset(asset_id: str):
-    asset = get_asset_db(asset_id)
+def get_asset(asset_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    asset = get_asset_db(asset_id, user_id=current_user["sub"])
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
     return asset
 
 
 @app.post("/api/assets")
-def register_asset(req: AssetCreateRequest):
+def register_asset(req: AssetCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     title = req.title
     if not title:
         try:
@@ -663,15 +1084,18 @@ def register_asset(req: AssetCreateRequest):
             title = info.get("title", "Untitled Video")
         except Exception:
             title = "Untitled Video"
-
-    return create_asset_db(req.url, title)
+    return create_asset_db(req.url, title, user_id=current_user["sub"])
 
 
 @app.patch("/api/assets/{asset_id}")
-def update_asset(asset_id: str, req: AssetUpdateRequest):
+def update_asset(
+    asset_id: str,
+    req: AssetUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     updates: Dict[str, Any] = {}
     if req.monitoringFrequency is not None:
-        updates["monitoringFrequency"] = req.monitoringFrequency
+        updates["monitoringFrequency"] = req.monitoringFrequency if req.monitoringFrequency else None
     if req.lastChecked is not None:
         try:
             updates["lastChecked"] = parse_iso_datetime(req.lastChecked)
@@ -680,23 +1104,94 @@ def update_asset(asset_id: str, req: AssetUpdateRequest):
     if req.status is not None:
         updates["status"] = req.status
 
-    asset = update_asset_db(asset_id, updates)
+    asset = update_asset_db(asset_id, updates, user_id=current_user["sub"])
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
+
+    # Sync APScheduler when frequency changes
+    if req.monitoringFrequency is not None:
+        if req.monitoringFrequency:
+            schedule_asset_job(asset_id, asset["url"], req.monitoringFrequency)
+        else:
+            unschedule_asset_job(asset_id)
+
     return asset
 
 
 @app.delete("/api/assets/{asset_id}")
-def delete_asset(asset_id: str):
-    removed = delete_asset_db(asset_id)
+def delete_asset(asset_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    unschedule_asset_job(asset_id)
+    removed = delete_asset_db(asset_id, user_id=current_user["sub"])
     if not removed:
         raise HTTPException(status_code=404, detail="Asset not found")
     return {"deleted": True, "asset": removed}
 
+
+@app.post("/api/assets/{asset_id}/scan")
+def trigger_asset_scan(
+    asset_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    asset = get_asset_db(asset_id, user_id=current_user["sub"])
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    job_id = str(uuid.uuid4())
+    create_job(job_id, "pending", {"stage": "queued", "percent": 0, "details": "On-demand scan queued"})
+    req = AnalyzeRequest(url=asset["url"])
+
+    def run_and_update():
+        update_asset_db(asset_id, {"status": "checking"})
+        try:
+            run_analysis_task(job_id, req)
+            update_asset_db(asset_id, {
+                "lastChecked": datetime.datetime.utcnow().isoformat(),
+                "status": "active",
+                "lastScanJobId": job_id,
+            })
+        except Exception as exc:
+            print(f"[Scan] On-demand scan failed for asset {asset_id}: {exc}")
+            update_asset_db(asset_id, {"status": "active"})
+
+    t = threading.Thread(target=run_and_update, daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "pending", "message": "Scan started"}
+
+
+@app.get("/api/assets/{asset_id}/results")
+def get_asset_results(
+    asset_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    asset = get_asset_db(asset_id, user_id=current_user["sub"])
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    last_job_id = asset.get("lastScanJobId")
+    if not last_job_id:
+        return {"status": "no_scan", "message": "No scan has been run for this asset yet"}
+
+    job = get_job(last_job_id)
+    if not job:
+        return {"status": "no_scan", "message": "Scan job not found"}
+    if job["status"] != "completed":
+        return {"status": job["status"], "message": "Scan not completed yet"}
+
+    results = job.get("results") or {}
+    risk_summary = results.get("risk_summary", {"high": 0, "medium": 0, "low": 0})
+    return {
+        "status": "completed",
+        "jobId": last_job_id,
+        "riskSummary": risk_summary,
+        "detectionCount": len(results.get("detections", [])),
+    }
+
+
+# ─── Debug ────────────────────────────────────────────────────────────────────
+
 @app.get("/api/debug/threads")
 def debug_threads():
     import traceback
-    import sys
     stacks = []
     for thread_id, frame in sys._current_frames().items():
         stacks.append(f"Thread ID: {thread_id}")

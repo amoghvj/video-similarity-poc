@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+
 import { motion, AnimatePresence } from 'framer-motion'
 import type { PropagationNode, Detection } from '../types'
 import { getRiskColor, formatViews } from '../lib/utils'

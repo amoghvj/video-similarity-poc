@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import { motion, useAnimation, animate } from 'framer-motion'
-import { Clock, Cpu, Layers, Shield, CheckCircle2, Fingerprint } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { motion, animate } from 'framer-motion'
+import { Clock, Cpu, Layers, CheckCircle2, Fingerprint } from 'lucide-react'
 import type { OriginalVideo, FingerprintInfo, RiskSummary } from '../types'
 
 interface HeroSectionProps {
@@ -163,15 +163,11 @@ const cardVariants = {
   visible: (i: number) => ({
     opacity: 1,
     y: 0,
-    transition: { duration: 0.55, delay: i * 0.12, ease: [0.22, 1, 0.36, 1] },
+    transition: { duration: 0.55, delay: i * 0.12, ease: [0.22, 1, 0.36, 1] as [number, number, number, number] },
   }),
 }
 
 export function HeroSection({ video, fingerprint, riskSummary }: HeroSectionProps) {
-  const uploadDate = new Date(video.uploadedAt).toLocaleDateString('en-US', {
-    month: 'short', day: 'numeric', year: 'numeric',
-  })
-
   return (
     <>
       {/* CSS keyframes injected globally */}
