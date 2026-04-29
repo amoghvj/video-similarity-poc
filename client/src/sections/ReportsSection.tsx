@@ -64,7 +64,7 @@ export function ReportsSection({ jobId, detections, riskSummary }: ReportsSectio
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [isReportModalOpen, setIsReportModalOpen] = useState(false)
   const [dateRange, setDateRange] = useState('14d')
-  const apiBase = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+  const apiBase = import.meta.env.VITE_API_BASE
 
   const getAuthHeader = (): Record<string, string> => {
     const token = localStorage.getItem('vg_token')

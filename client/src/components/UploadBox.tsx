@@ -2,7 +2,7 @@ import { useState, useRef } from 'react'
 import { Upload, FileVideo, X, CheckCircle2, AlertTriangle } from 'lucide-react'
 import { RiskBadge } from './RiskBadge'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE
 
 interface PrecheckDetection {
   id: string
