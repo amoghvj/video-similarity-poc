@@ -99,9 +99,6 @@ export function LoadingScreen({ onComplete }: LoadingScreenProps) {
 
               {/* Signal pulse lines */}
               {[0, 60, 120, 180, 240, 300].map((angle, i) => {
-                const rad = (angle * Math.PI) / 180
-                const x2 = 85 * Math.cos(rad)
-                const y2 = 85 * Math.sin(rad)
                 return (
                   <motion.div
                     key={angle}

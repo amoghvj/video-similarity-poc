@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, Bot, Download, AlertCircle, TrendingUp, CheckCircle2 } from 'lucide-react'
+import { X, Bot, Download, AlertCircle, CheckCircle2 } from 'lucide-react'
 
 interface ReportModalProps {
   isOpen: boolean

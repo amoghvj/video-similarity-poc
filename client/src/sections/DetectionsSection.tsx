@@ -120,7 +120,7 @@ function DetectionCard({
   )
 }
 
-export function DetectionsSection({ detections, selectedDetection, onSelectDetection, onNavigateToReports }: DetectionsSectionProps) {
+export function DetectionsSection({ detections, selectedDetection, onSelectDetection }: DetectionsSectionProps) {
   const [filterRisk, setFilterRisk] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [reviewedIds, setReviewedIds] = useState<Set<string>>(new Set())
@@ -183,7 +183,7 @@ export function DetectionsSection({ detections, selectedDetection, onSelectDetec
     .filter(d => !searchQuery || d.title.toLowerCase().includes(searchQuery.toLowerCase()) || d.channel.toLowerCase().includes(searchQuery.toLowerCase()))
     .filter(d => !reviewedIds.has(d.id))
 
-  const highlights = selectedDetection ? (mockExplainability[selectedDetection.id]?.highlights ?? []) : []
+  const highlights = selectedDetection ? ((mockExplainability as unknown as Record<string, { highlights?: string[] } | undefined>)[selectedDetection.id]?.highlights ?? []) : []
 
   return (
     <section className="h-full flex flex-col gap-5">

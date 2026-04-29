@@ -116,12 +116,10 @@ function AppContent() {
             />
             <MainGridSection
               detections={results.detections}
-              propagationNodes={results.propagation_nodes}
               metrics={results.metrics}
               riskSummary={results.risk_summary}
               selectedDetection={selectedDetection}
               onSelectDetection={handleSelectDetection}
-              onRadarNodeClick={setRadarModalType}
             />
           </div>
         )}
@@ -151,8 +149,7 @@ function AppContent() {
         {activePage === 'reports' && (
           <ReportsSection
             jobId={jobId!}
-            detections={reportIds.size > 0 ? results.detections.filter(d => reportIds.has(d.id)) : results.detections}
-            metrics={results.metrics}
+            detections={reportIds.size > 0 ? results.detections.filter((d: Detection) => reportIds.has(d.id)) : results.detections}
             riskSummary={results.risk_summary}
           />
         )}
