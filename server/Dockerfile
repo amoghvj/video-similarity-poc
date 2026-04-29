@@ -15,4 +15,6 @@ COPY . .
 
 ENV PORT=8080
 
+EXPOSE $PORT
+
 CMD sh -c "uvicorn api:app --host 0.0.0.0 --port $PORT"
