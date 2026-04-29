@@ -548,7 +548,7 @@ def reload_scheduled_jobs() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    init_db()
+    # init_db()
     get_scheduler().start()
     reload_scheduled_jobs()
 
