@@ -82,6 +82,18 @@ def get_db_pool() -> pool.SimpleConnectionPool:
             password=DB_PASS,
             connect_timeout=5,
         )
+        # Ensure schema migrations (safe re-runs) using a connection from the pool
+        conn = _db_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS user_id UUID")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_scan_job_id UUID")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS url TEXT")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_checked TIMESTAMPTZ")
+                cur.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'idle'")
+            conn.commit()
+        finally:
+            _db_pool.putconn(conn)
     return _db_pool
 
 
@@ -175,15 +187,29 @@ def serialize_job(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_HOURS_TO_FREQ = {1: "1h", 2: "2h", 6: "6h", 24: "24h"}
+
+
 def serialize_asset(row: Dict[str, Any]) -> Dict[str, Any]:
+    freq_raw = row.get("monitoring_frequency")
+    if isinstance(freq_raw, int):
+        freq = _HOURS_TO_FREQ.get(freq_raw, str(freq_raw) + "h")
+    elif isinstance(freq_raw, str) and freq_raw.isdigit():
+        freq = _HOURS_TO_FREQ.get(int(freq_raw), freq_raw + "h")
+    else:
+        freq = freq_raw  # already "1h" / None
+
+    last_checked = row.get("last_checked")
+    added_at = row.get("created_at") or row.get("added_at")
+
     return {
         "id": str(row["id"]),
-        "url": row["url"],
+        "url": row.get("url") or row.get("source_url") or "",
         "title": row["title"],
-        "addedAt": row["added_at"].isoformat() if row.get("added_at") else None,
-        "monitoringFrequency": row.get("monitoring_frequency"),
-        "lastChecked": row["last_checked"].isoformat() if row.get("last_checked") else None,
-        "status": row.get("status", "idle"),
+        "addedAt": added_at.isoformat() if added_at else None,
+        "monitoringFrequency": freq,
+        "lastChecked": last_checked.isoformat() if last_checked else None,
+        "status": row.get("status") or row.get("fingerprint_status") or "idle",
         "lastScanJobId": str(row["last_scan_job_id"]) if row.get("last_scan_job_id") else None,
     }
 
@@ -295,11 +321,11 @@ def list_assets_db(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with db_cursor() as cursor:
         if user_id:
             cursor.execute(
-                "SELECT * FROM assets WHERE user_id = %s ORDER BY added_at DESC",
+                "SELECT * FROM assets WHERE user_id = %s ORDER BY created_at DESC",
                 (user_id,),
             )
         else:
-            cursor.execute("SELECT * FROM assets ORDER BY added_at DESC")
+            cursor.execute("SELECT * FROM assets ORDER BY created_at DESC")
         rows = cursor.fetchall() or []
         return [serialize_asset(row) for row in rows]
 
@@ -321,15 +347,17 @@ def get_asset_db(asset_id: str, user_id: Optional[str] = None) -> Optional[Dict[
 
 
 def create_asset_db(url: str, title: str, user_id: Optional[str] = None) -> Dict[str, Any]:
-    asset_id = uuid.uuid4()
+    asset_id = str(uuid.uuid4())
+    org_id = os.getenv("DEFAULT_ORG_ID", "org-default")
     with db_cursor() as cursor:
         cursor.execute(
             """
-            INSERT INTO assets (id, url, title, user_id)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO assets
+                (id, url, source_url, title, org_id, platform, fingerprint_status, embedding_dim, created_at, user_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             RETURNING *
             """,
-            (str(asset_id), url, title, user_id),
+            (asset_id, url, url, title, org_id, "youtube", "pending", 3072, user_id),
         )
         return serialize_asset(cursor.fetchone())
 
@@ -344,7 +372,11 @@ def update_asset_db(
 
     if "monitoringFrequency" in updates:
         fields.append("monitoring_frequency = %s")
-        values.append(updates["monitoringFrequency"])
+        freq_val = updates["monitoringFrequency"]
+        # DB column is integer (hours); frontend sends "1h"/"2h" etc.
+        if isinstance(freq_val, str) and freq_val.endswith("h") and freq_val[:-1].isdigit():
+            freq_val = int(freq_val[:-1])
+        values.append(freq_val)
     if "lastChecked" in updates:
         fields.append("last_checked = %s")
         values.append(updates["lastChecked"])
@@ -396,15 +428,22 @@ def delete_asset_db(asset_id: str, user_id: Optional[str] = None) -> Optional[Di
 
 # ─── Auth utilities ───────────────────────────────────────────────────────────
 
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_pwd_ctx = None
+
+
+def get_pwd_ctx():
+    global _pwd_ctx
+    if _pwd_ctx is None:
+        _pwd_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
+    return _pwd_ctx
 
 
 def hash_password(plain: str) -> str:
-    return _pwd_ctx.hash(plain)
+    return get_pwd_ctx().hash(plain)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    return get_pwd_ctx().verify(plain, hashed)
 
 
 def create_access_token(user_id: str, email: str, display_name: str) -> str:
@@ -493,11 +532,15 @@ def reload_scheduled_jobs() -> None:
     """Re-register all active scheduled assets on server startup."""
     with db_cursor() as cursor:
         cursor.execute(
-            "SELECT id, url, monitoring_frequency FROM assets WHERE monitoring_frequency IS NOT NULL"
+            "SELECT id, url, source_url, monitoring_frequency FROM assets WHERE monitoring_frequency IS NOT NULL"
         )
         rows = cursor.fetchall() or []
     for row in rows:
-        schedule_asset_job(str(row["id"]), row["url"], row["monitoring_frequency"])
+        asset_url = row.get("url") or row.get("source_url") or ""
+        freq_raw = row["monitoring_frequency"]
+        # Convert integer hours back to "Xh" key for FREQ_TO_HOURS lookup
+        freq_str = _HOURS_TO_FREQ.get(int(freq_raw), "24h") if freq_raw else "24h"
+        schedule_asset_job(str(row["id"]), asset_url, freq_str)
     print(f"[Scheduler] Reloaded {len(rows)} scheduled asset jobs")
 
 
