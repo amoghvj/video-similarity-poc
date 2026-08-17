@@ -1,5 +1,13 @@
 import sys
 import os
+
+# Force UTF-8 output on Windows to prevent UnicodeEncodeError crashes
+# when printing YouTube video titles containing emojis/special chars
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import datetime
 import time
 import uuid
@@ -25,7 +33,7 @@ import jwt as pyjwt
 from passlib.context import CryptContext
 from apscheduler.schedulers.background import BackgroundScheduler
 
-load_dotenv()
+load_dotenv(override=True)
 
 from src.analyzer import Analyzer
 from src.video_processor import VideoProcessor
@@ -40,7 +48,15 @@ app = FastAPI()
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=[
+        FRONTEND_ORIGIN,
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "https://app.monitordash.com",
+        "https://monitordash.com"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -577,6 +593,8 @@ class AnalyzeRequest(BaseModel):
     frames: int = 3
     candidate_frames: int = 0
     threshold: float = 0.85
+    input_metadata: dict | None = None
+    input_frames: list[str] | None = None
 
 
 class AssetCreateRequest(BaseModel):
@@ -604,24 +622,54 @@ class LoginRequest(BaseModel):
 # ─── Analysis pipeline ───────────────────────────────────────────────────────
 
 def run_analysis_task(job_id: str, req: AnalyzeRequest) -> None:
+    from src.vectorise import vectorise_from_frames
+    import base64
+    import io
+    from PIL import Image
+
     update_job(
         job_id,
         status="active",
         progress={"stage": "extracting", "percent": 10, "details": "Extracting input video..."},
     )
     try:
-        analyzer = Analyzer(
-            n_frames=req.frames,
-            m_frames=req.candidate_frames,
-            threshold=req.threshold,
-            max_candidates=10,
-        )
         update_job(
             job_id,
             progress={"stage": "detecting", "percent": 50, "details": "Analyzing candidates..."},
         )
 
-        raw_results = analyzer.run(req.url)
+        if req.input_metadata and req.input_frames:
+            # Path A: Pre-extracted frames from Electron client
+            pil_frames = []
+            for b64 in req.input_frames:
+                img_bytes = base64.b64decode(b64)
+                pil_frames.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+            
+            input_vector = vectorise_from_frames(
+                frames=pil_frames,
+                title=req.input_metadata.get("title", "Unknown"),
+                video_id=req.input_metadata.get("id", ""),
+                duration=req.input_metadata.get("duration", 0),
+                thumbnail_url=req.input_metadata.get("thumbnail", ""),
+                uploader=req.input_metadata.get("uploader", "Unknown Channel"),
+            )
+            
+            analyzer = Analyzer(
+                n_frames=req.frames,
+                m_frames=req.candidate_frames,
+                threshold=req.threshold,
+                max_candidates=10,
+            )
+            raw_results = analyzer.run_with_vector(req.url, input_vector)
+        else:
+            # Path B: Server-side extraction (existing flow)
+            analyzer = Analyzer(
+                n_frames=req.frames,
+                m_frames=req.candidate_frames,
+                threshold=req.threshold,
+                max_candidates=10,
+            )
+            raw_results = analyzer.run(req.url)
 
         high_risk = 0
         med_risk = 0

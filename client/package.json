@@ -1,12 +1,38 @@
 {
   "name": "client",
+  "main": "electron/main.js",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "electron:dev": "concurrently \"vite --port 5173\" \"wait-on http://localhost:5173 && tsc --project electron/tsconfig.json && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "electron:build": "vite build && tsc --project electron/tsconfig.json && electron-builder"
+  },
+  "build": {
+    "appId": "com.framelock.ai",
+    "productName": "FrameLock.AI",
+    "files": [
+      "dist/**/*",
+      "electron/**/*.js"
+    ],
+    "extraResources": [
+      {
+        "from": "bin/",
+        "to": "bin/",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    }
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.4",
@@ -14,10 +40,15 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
     "autoprefixer": "^10.5.0",
+    "concurrently": "^10.0.5",
+    "cross-env": "^10.1.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
     "postcss": "^8.5.12",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.2",
-    "vite": "^8.0.10"
+    "vite": "^8.0.10",
+    "wait-on": "^9.1.0"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

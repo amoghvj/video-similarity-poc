@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { isElectron, extractVideoLocally } from '../services/electronBridge'
 
 const API_BASE = import.meta.env.VITE_API_BASE
 
@@ -10,15 +11,33 @@ function getAuthHeader(): Record<string, string> {
 export function useAnalyze() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [extractionStage, setExtractionStage] = useState<string | null>(null)
 
   const startAnalysis = async (url: string, frames: number = 3, threshold: number = 0.85) => {
     setIsSubmitting(true)
     setError(null)
     try {
+      let body: any = { url, frames, threshold }
+
+      // If running in Electron, extract frames locally first
+      if (isElectron() && frames > 0) {
+        setExtractionStage('Fetching video metadata...')
+        const extracted = await extractVideoLocally(url, frames)
+        setExtractionStage(`Extracted ${extracted.frames.length} frames. Uploading...`)
+        body = {
+          url,
+          frames,
+          threshold,
+          input_metadata: extracted.metadata,
+          input_frames: extracted.frames, // base64 PNGs
+        }
+      }
+
+      setExtractionStage(null)
       const res = await fetch(`${API_BASE}/api/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
-        body: JSON.stringify({ url, frames, threshold }),
+        body: JSON.stringify(body),
       })
       if (!res.ok) throw new Error('Failed to start analysis')
       const data = await res.json()
@@ -31,7 +50,7 @@ export function useAnalyze() {
     }
   }
 
-  return { startAnalysis, isSubmitting, error }
+  return { startAnalysis, isSubmitting, error, extractionStage }
 }
 
 export function useJobStatus(jobId: string | null) {

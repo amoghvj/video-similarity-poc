@@ -120,9 +120,9 @@ class SearchService:
                     "thumbnail_url": thumbnail_url,
                 })
 
-            print(f"  ✓ Found {len(candidates)} candidate videos")
+            print(f"  [+] Found {len(candidates)} candidate videos")
             return candidates
 
         except Exception as e:
-            print(f"  ✗ Search failed: {e}")
+            print(f"  [X] Search failed: {e}")
             return []

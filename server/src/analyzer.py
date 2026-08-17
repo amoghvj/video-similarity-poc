@@ -130,3 +130,80 @@ class Analyzer:
         results["matches"].sort(key=lambda x: x["max_similarity"], reverse=True)
 
         return results
+
+    def run_with_vector(self, youtube_url: str, input_vector: 'VectorEmbedding') -> dict:
+        """Run the pipeline with a pre-built input vector (from Electron client)."""
+        results = {
+            "input_video": {
+                "title": input_vector.title,
+                "id": input_vector.video_id,
+                "url": youtube_url,
+                "duration": input_vector.duration,
+                "thumbnail_url": input_vector.thumbnail,
+                "uploader": input_vector.uploader,
+            },
+            "candidates": [],
+            "matches": [],
+            "threshold": self.threshold,
+            "n_frames": input_vector.frame_count,
+        }
+
+        # === Step 2: Search YouTube for candidates ===
+        print(f"\n[2/4] Searching YouTube for similar videos...")
+        candidates = self.search_service.search_videos(input_vector.title)
+        if not candidates:
+            print("  No candidates found.")
+            return results
+
+        # Filter out the input video itself
+        candidates = [c for c in candidates if c["id"] != input_vector.video_id]
+        print(f"  Found {len(candidates)} candidates after filtering self")
+
+        # === Step 3: Compare with candidates ===
+        print(f"\n[3/4] Comparing with {len(candidates)} candidates...")
+        
+        # This will BLOCK if any background embeddings are still pending
+        frame_embeddings = input_vector.get_vectors()
+
+        for i, candidate in enumerate(candidates):
+            try:
+                # Use vectorise for the candidate (handles thumbnail + M frames)
+                print(f"  [{i+1}/{len(candidates)}] Vectorising candidate: {candidate['title'][:40]}...")
+                candidate_vector = vectorise(candidate["url"], n_frames=self.m_frames)
+                candidate_embeddings = candidate_vector.get_vectors()
+                
+                max_sim = self.similarity_service.compute_max_similarity(
+                    frame_embeddings, candidate_embeddings
+                )
+                avg_sim = self.similarity_service.compute_avg_similarity(
+                    frame_embeddings, candidate_embeddings
+                )
+                is_match = max_sim >= self.threshold
+
+                result_entry = {
+                    "title": candidate["title"],
+                    "url": candidate["url"],
+                    "thumbnail_url": candidate["thumbnail_url"],
+                    "uploader": candidate.get("uploader", "Unknown Channel"),
+                    "max_similarity": round(max_sim, 4),
+                    "avg_similarity": round(avg_sim, 4),
+                    "is_match": is_match,
+                }
+                results["candidates"].append(result_entry)
+
+                if is_match:
+                    results["matches"].append(result_entry)
+
+                status = "MATCH" if is_match else "NO MATCH"
+                print(f"  [{i+1}/{len(candidates)}] {status} {max_sim:.4f} - {candidate['title'][:60]}")
+
+            except RuntimeError as e:
+                print(f"  [{i+1}/{len(candidates)}] Skipped (thumbnail error): {candidate['title'][:40]}")
+                continue
+
+        # === Step 4: Sort & Summarize ===
+        print(f"\n[4/4] Finalizing results...")
+        results["candidates"].sort(key=lambda x: x["max_similarity"], reverse=True)
+        results["matches"].sort(key=lambda x: x["max_similarity"], reverse=True)
+
+        return results

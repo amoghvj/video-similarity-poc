@@ -1,12 +1,15 @@
 import { useState } from 'react'
 import { Card } from '../components/Card'
 import { useAnalyze } from '../hooks/useApi'
+import { isElectron } from '../services/electronBridge'
+
+// Detect environment at render time
+const canExtractFrames = isElectron()
 
 export function NewScanSection({ onJobStarted }: { onJobStarted: (id: string) => void }) {
-  const { startAnalysis, isSubmitting, error } = useAnalyze()
+  const { startAnalysis, isSubmitting, error, extractionStage } = useAnalyze()
   const [url, setUrl] = useState('')
-  // const [frames, setFrames] = useState(3)  // [INTERIM HOTFIX] Old default — frame extraction via yt-dlp
-  const [frames, setFrames] = useState(0)       // [INTERIM HOTFIX] Forced to 0 — thumbnail-only mode (no yt-dlp on cloud)
+  const [frames, setFrames] = useState(canExtractFrames ? 3 : 0)
   const [threshold, setThreshold] = useState(0.85)
   const [enableFrameByFrame, setEnableFrameByFrame] = useState(false)
 
@@ -54,7 +57,6 @@ export function NewScanSection({ onJobStarted }: { onJobStarted: (id: string) =>
           <div className="grid grid-cols-2 gap-6">
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: '#52525B' }}>
-                {/* [INTERIM HOTFIX] Show "Thumbnail Only" instead of frame count */}
                 Frames to Extract: {frames === 0 ? 'Thumbnail Only' : frames}
               </label>
               <input
@@ -64,12 +66,13 @@ export function NewScanSection({ onJobStarted }: { onJobStarted: (id: string) =>
                 value={frames}
                 onChange={(e) => setFrames(parseInt(e.target.value))}
                 className="w-full"
-                // [INTERIM HOTFIX] Disabled — frame extraction requires yt-dlp stream URLs
-                disabled={true}
-                style={{ opacity: 0.35, cursor: 'not-allowed' }}
+                disabled={!canExtractFrames || isSubmitting}
+                style={!canExtractFrames ? { opacity: 0.35, cursor: 'not-allowed' } : {}}
               />
               <p className="text-[10px] mt-1" style={{ color: '#52525B' }}>
-                ⓘ Frame extraction disabled in cloud mode — using thumbnail comparison
+                {canExtractFrames
+                  ? '✓ Running in desktop mode — full frame extraction available'
+                  : 'ⓘ Frame extraction disabled in cloud mode — using thumbnail comparison'}
               </p>
             </div>
             <div>
@@ -96,21 +99,19 @@ export function NewScanSection({ onJobStarted }: { onJobStarted: (id: string) =>
                 checked={enableFrameByFrame}
                 onChange={(e) => setEnableFrameByFrame(e.target.checked)}
                 className="w-4 h-4 rounded"
-                // [INTERIM HOTFIX] Disabled — candidate frame extraction requires yt-dlp
-                disabled={true}
-                style={{
+                disabled={!canExtractFrames}
+                style={!canExtractFrames ? {
                   accentColor: '#6366F1',
                   opacity: 0.35,
-                }}
+                } : { accentColor: '#6366F1' }}
               />
               <span className="text-sm" style={{ color: '#52525B' }}>
                 Enable Frame-by-Frame Search (Candidate Key Analysis)
               </span>
             </label>
             <p className="text-[10px] mt-1 ml-7" style={{ color: '#52525B' }}>
-              ⓘ Disabled in cloud mode — will be available in desktop app
+              {!canExtractFrames && 'ⓘ Disabled in cloud mode — will be available in desktop app'}
             </p>
-            {/* [INTERIM HOTFIX] Original conditional kept but unreachable since checkbox is disabled */}
             {enableFrameByFrame && (
               <p className="text-xs mt-2" style={{ color: '#52525B' }}>
                 ✓ This will perform detailed frame-by-frame comparison for more precise detection
@@ -134,7 +135,7 @@ export function NewScanSection({ onJobStarted }: { onJobStarted: (id: string) =>
               opacity: (isSubmitting || !url) ? 0.5 : 1,
             }}
           >
-            {isSubmitting ? 'Initializing Job...' : 'Start Scan'}
+            {isSubmitting ? (extractionStage || 'Initializing Job...') : 'Start Scan'}
           </button>
         </form>
       </Card>

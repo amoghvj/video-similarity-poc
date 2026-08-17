@@ -356,3 +356,31 @@ def vectorise(url: str, n_frames: int = 3) -> VectorEmbedding:
           f"({vector.pending_count} still embedding)")
 
     return vector
+
+def vectorise_from_frames(
+    frames: list,
+    title: str = "Unknown",
+    video_id: str = "",
+    duration: float = 0.0,
+    thumbnail_url: str = "",
+    uploader: str = "Unknown Channel",
+) -> VectorEmbedding:
+    """
+    Create a VectorEmbedding from pre-extracted frames.
+    Used when the Electron client has already extracted frames locally.
+
+    No network I/O or yt-dlp calls are made — frames are embedded directly.
+    """
+    vector = VectorEmbedding(
+        title=title,
+        video_id=video_id,
+        duration=duration,
+        thumbnail=thumbnail_url,
+        uploader=uploader,
+    )
+
+    for frame in frames:
+        vector.add(frame)
+
+    print(f"  -> Embedded {vector.frame_count} pre-extracted frames")
+    return vector
